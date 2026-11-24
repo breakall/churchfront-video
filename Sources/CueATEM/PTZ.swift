@@ -180,7 +180,7 @@ public struct PTZShot: Codable, Hashable, Identifiable {
 }
 
 /// One camera connection, whatever the protocol.
-protocol PTZLink: AnyObject {
+public protocol PTZLink: AnyObject {
     var onState: ((Bool) -> Void)? { get set }
     /// Preset names the camera reports, by number from 1.
     var onPresets: (([Int: String]) -> Void)? { get set }
@@ -197,6 +197,10 @@ protocol PTZLink: AnyObject {
     /// Speeds in the camera's own units, signed (right and up positive), 0 stops. On Canon
     /// that's hundredths of a degree a second (10 to 10000). Used by auto tracking.
     func driveRaw(pan: Int, tilt: Int)
+    /// Tracking retains its purpose across an external camera-control adapter.
+    func trackDrive(pan: Double, tilt: Double)
+    func trackDriveRaw(pan: Int, tilt: Int)
+    func trackZoom(_ v: Double)
     func zoom(_ v: Double)
     func autoFocus(_ on: Bool)
     func focusOnce()
@@ -219,8 +223,11 @@ protocol PTZLink: AnyObject {
     func autoExposure()
 }
 
-extension PTZLink {
+public extension PTZLink {
     func readShotPosition(_ done: @escaping (PTZPosition?) -> Void) { readPosition(done) }
+    func trackDrive(pan: Double, tilt: Double) { drive(pan: pan, tilt: tilt) }
+    func trackDriveRaw(pan: Int, tilt: Int) { driveRaw(pan: pan, tilt: tilt) }
+    func trackZoom(_ v: Double) { zoom(v) }
 }
 
 // MARK: - VISCA
@@ -583,6 +590,7 @@ final class CanonLink: PTZLink {
     private var session: String?
     private var opening = false
     private var stopped = false
+    private var connectionGeneration = UUID()
     private var timer: DispatchSourceTimer?
     private var lastPresetRead = Date.distantPast
     var onState: ((Bool) -> Void)?
@@ -623,11 +631,13 @@ final class CanonLink: PTZLink {
 
     private func get(_ path: String, _ done: ((String?) -> Void)? = nil) {
         guard let url = URL(string: base + path) else { done?(nil); return }
+        let generation = connectionGeneration
         http.dataTask(with: url) { [weak self] data, resp, err in
             guard let self else { return }
             let text = data.map { String(decoding: $0, as: UTF8.self) }
             let ok = err == nil && (resp as? HTTPURLResponse)?.statusCode == 200
             self.queue.async {
+                guard self.connectionGeneration == generation else { return }
                 if !ok, text?.contains("Error") != false {
                     done?(nil)
                 } else {
@@ -650,7 +660,10 @@ final class CanonLink: PTZLink {
 
     func stop() {
         stopped = true
+        connectionGeneration = UUID()
         timer?.cancel(); timer = nil
+        queued.removeAll()
+        lastDrive = ""; lastZoom = ""
         if let s = session { get("close.cgi?s=\(s)") }
         session = nil
         online = false
@@ -792,7 +805,7 @@ final class CanonLink: PTZLink {
     private static func isStop(_ query: String) -> Bool { query == "pan=stop&tilt=stop" || query == "zoom=stop" }
 
     private func pump() {
-        guard !sending, !queued.isEmpty else { return }
+        guard !stopped, !sending, !queued.isEmpty else { return }
         // No session: moves that were waiting are dropped, but a stop is kept and sent as
         // soon as the camera is back, so it can't be left moving.
         guard let s = session else { queued.removeAll { !Self.isStop($0.query) }; open(); return }
@@ -851,7 +864,7 @@ final class CanonLink: PTZLink {
     /// never keeps moving because one stop went missing.
     private func resendStop(_ q: String, key: String, latest: @escaping (CanonLink) -> String) {
         queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self, latest(self) == q else { return }
+            guard let self, !self.stopped, latest(self) == q else { return }
             self.control(q, key: key)
         }
     }
@@ -940,6 +953,14 @@ final class CanonLink: PTZLink {
 // MARK: - Controller
 
 public final class PTZController: ObservableObject {
+    /// A configured camera must return its adapter even when that route is offline.
+    /// Returning nil selects the ordinary connection for an unmanaged camera.
+    public var linkFactory: ((PTZCamera, DispatchQueue) -> PTZLink?)? {
+        didSet { restart() }
+    }
+    /// Captured before entering the camera queue. A bridge generation change discards
+    /// queued software commands, including stops, instead of giving them a new lease.
+    public var commandFence: ((UUID) -> String?)?
     @Published public var cameras: [PTZCamera] = [] { didSet { save(); if links(differ: oldValue) { restart() } } }
     /// The camera the joystick, zoom and arrow keys drive. When it changes while the old
     /// camera is being moved by hand (Next was cut to Live with the joystick still held),
@@ -970,7 +991,8 @@ public final class PTZController: ObservableObject {
     private var moving: Set<UUID> = [], zooming: Set<UUID> = []
     private let key = "ptzCameras"
 
-    public init(load: Bool = true) {
+    public init(load: Bool = true, linkFactory: ((PTZCamera, DispatchQueue) -> PTZLink?)? = nil) {
+        self.linkFactory = linkFactory
         if load, let d = UserDefaults.standard.data(forKey: key), let c = try? JSONDecoder().decode([PTZCamera].self, from: d) {
             cameras = c
         }
@@ -989,11 +1011,13 @@ public final class PTZController: ObservableObject {
 
     private func restart() {
         let cams = cameras
+        let factory = linkFactory
         queue.async {
             for l in self.links.values { l.stop() }
             self.links = [:]
             for c in cams {
-                let l: PTZLink = c.proto == .canonXC ? CanonLink(c, queue: self.queue) : VISCALink(c, queue: self.queue)
+                let l: PTZLink = factory?(c, self.queue)
+                    ?? (c.proto == .canonXC ? CanonLink(c, queue: self.queue) : VISCALink(c, queue: self.queue))
                 l.onState = { [weak self] on in
                     DispatchQueue.main.async { if on { self?.online.insert(c.id) } else { self?.online.remove(c.id) } }
                 }
@@ -1041,11 +1065,11 @@ public final class PTZController: ObservableObject {
     }
 
     /// Zoom for auto tracking, -1 to 1, without counting as a manual zoom.
-    public func trackZoom(_ v: Double, camera: UUID) { with(camera) { $0.zoom(max(-1, min(1, v))) } }
+    public func trackZoom(_ v: Double, camera: UUID) { with(camera) { $0.trackZoom(max(-1, min(1, v))) } }
 
     /// Pan and tilt for auto tracking in the camera's own speed units (Canon: hundredths of a
     /// degree a second), signed, without counting as a manual move.
-    public func trackDriveRaw(pan: Int, tilt: Int, camera: UUID) { with(camera) { $0.driveRaw(pan: pan, tilt: tilt) } }
+    public func trackDriveRaw(pan: Int, tilt: Int, camera: UUID) { with(camera) { $0.trackDriveRaw(pan: pan, tilt: tilt) } }
 
     /// Where a camera is now (Canon: pan and tilt in hundredths of a degree, zoom as the
     /// horizontal angle of view in hundredths of a degree), on main; nil if it can't say.
@@ -1055,12 +1079,16 @@ public final class PTZController: ObservableObject {
 
     /// Pan and tilt for auto tracking: speeds -1 to 1, sent as given, without counting as a manual move.
     public func trackDrive(pan: Double, tilt: Double, camera: UUID) {
-        with(camera) { $0.drive(pan: max(-1, min(1, pan)), tilt: max(-1, min(1, tilt))) }
+        with(camera) { $0.trackDrive(pan: max(-1, min(1, pan)), tilt: max(-1, min(1, tilt))) }
     }
 
     private func with(_ id: UUID? = nil, _ f: @escaping (PTZLink) -> Void) {
         guard let id = id ?? selected else { return }
-        queue.async { if let l = self.links[id] { f(l) } }
+        let fence = commandFence?(id)
+        queue.async {
+            guard self.commandFence?(id) == fence else { return }
+            if let l = self.links[id] { f(l) }
+        }
     }
 
     /// Pan and tilt from a joystick: x and y from -1 to 1, up is positive y.

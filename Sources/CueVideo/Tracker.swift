@@ -184,6 +184,10 @@ final class AutoTracker: ObservableObject {
     private var busy: Set<UUID> = []
     private var waiters: [UUID: [(String?) -> Void]] = [:]
     private var timer: Timer?
+    /// Bridge integration only: existing starts wait for helper authorization.
+    var authorizeStart: ((UUID, @escaping (String?) -> Void) -> Void)?
+    var revokeAuthorization: ((UUID) -> Void)?
+    private var pendingStarts: [UUID: UUID] = [:]
     // Concurrent, so cameras tracking at once each get their own frames looked at; `busy` keeps
     // one frame per camera in flight.
     private let vision = DispatchQueue(label: "cuevideo.tracker", qos: .userInitiated, attributes: .concurrent)
@@ -195,7 +199,9 @@ final class AutoTracker: ObservableObject {
 
     /// Hooks the tracker to the camera controls. Called once at launch.
     func attach() {
-        ptz.onManualMove = { [weak self] id in self?.stop(id) }
+        ptz.onManualMove = { [weak self] id in
+            self?.stop(id, revoke: !CameraBridgeRuntime.shared.isManaged(id))
+        }
         ptz.onManualZoom = { [weak self] id in self?.manualZoom(id) }
     }
 
@@ -207,14 +213,37 @@ final class AutoTracker: ObservableObject {
     /// once someone is found, or the reason no one was.
     /// `person` follows someone labelled in the last stage scan, by name, wherever they are in the shot.
     func start(_ camera: PTZCamera, at point: CGPoint? = nil, size: ShotSize? = nil, person: String? = nil, done: ((String?) -> Void)? = nil) {
-        stop(camera.id)
+        stop(camera.id, revoke: false)
+        guard let authorizeStart else {
+            begin(camera, at: point, size: size, person: person, done: done)
+            return
+        }
+        let request = UUID()
+        pendingStarts[camera.id] = request
+        authorizeStart(camera.id) { [weak self] why in
+            guard let self else { return }
+            guard self.pendingStarts[camera.id] == request else {
+                if why == nil, self.pendingStarts[camera.id] == nil, self.sessions[camera.id] == nil {
+                    self.revokeAuthorization?(camera.id)
+                }
+                return
+            }
+            self.pendingStarts[camera.id] = nil
+            if let why { done?(why); return }
+            self.begin(camera, at: point, size: size, person: person, done: done)
+        }
+    }
+
+    private func begin(_ camera: PTZCamera, at point: CGPoint?, size: ShotSize?, person: String?, done: ((String?) -> Void)?) {
         guard let picture = CameraPicture.of(camera) else {
+            revokeAuthorization?(camera.id)
             done?("Auto tracking needs the camera's picture: a Canon camera, or an NDI picture set for its switcher input in Setup.")
             return
         }
         var s = Session(camera: camera.id)
         if let person {
             guard let cast = StageCast.shared.look(person) else {
+                revokeAuthorization?(camera.id)
                 let names = StageCast.shared.names
                 done?(names.isEmpty ? "No one has been labelled yet. Run a stage scan first."
                                     : "No one called \(person) in the last stage scan. It has: \(names.joined(separator: ", ")).")
@@ -252,7 +281,9 @@ final class AutoTracker: ObservableObject {
         sessions[id] = s
     }
 
-    func stop(_ id: UUID) {
+    func stop(_ id: UUID, revoke: Bool = true) {
+        let wasPending = pendingStarts.removeValue(forKey: id) != nil
+        if revoke, sessions[id] != nil || wasPending { revokeAuthorization?(id) }
         guard let s = sessions[id] else { return }
         sessions[id] = nil
         feeds[id] = nil
@@ -265,7 +296,7 @@ final class AutoTracker: ObservableObject {
         if sessions.isEmpty { timer?.invalidate(); timer = nil }
     }
 
-    func stopAll() { for id in sessions.keys { stop(id) } }
+    func stopAll() { for id in Set(sessions.keys).union(pendingStarts.keys) { stop(id) } }
 
     /// The volunteer (or Claude) zoomed: stop holding the old size for a moment, then hold the new one.
     private func manualZoom(_ id: UUID) {

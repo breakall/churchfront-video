@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "CueATEM", targets: ["CueATEM"]),
     ],
     dependencies: [
+        .package(path: "Packages/CameraControlBridge"),
         // Churchfront Kit (formerly CueKit), shared with the other suite apps: the Signal design tokens and Figtree.
         .package(url: "https://github.com/Churchfront/churchfront-kit.git", from: "0.2.1"),
     ],
@@ -22,11 +23,13 @@ let package = Package(
         .executableTarget(name: "CueVideoMCP", path: "Sources/CueVideoMCP"),
         .executableTarget(
             name: "CueVideo",
-            dependencies: ["CueATEM", "NDIBridge", .product(name: "CueDesign", package: "churchfront-kit")],
+            dependencies: ["CueATEM", "NDIBridge", .product(name: "CueDesign", package: "churchfront-kit"),
+                           .product(name: "CameraBridgeClient", package: "CameraControlBridge")],
             path: "Sources/CueVideo"
         ),
         // Runs the camera code against pretend cameras on this Mac: swift test
         .testTarget(name: "CueATEMTests", dependencies: ["CueATEM"], path: "Tests/CueATEMTests"),
-        .testTarget(name: "CueVideoTests", dependencies: ["CueVideo", "CueATEM"], path: "Tests/CueVideoTests"),
+        .testTarget(name: "CueVideoTests", dependencies: ["CueVideo", "CueATEM",
+            .product(name: "CameraBridgeClient", package: "CameraControlBridge")], path: "Tests/CueVideoTests"),
     ]
 )

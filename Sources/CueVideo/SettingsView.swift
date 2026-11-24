@@ -266,6 +266,7 @@ struct SetupTab: View {
                 CameraLoginRow()
             }
             .frame(maxWidth: 760, alignment: .leading)
+            CameraBridgeSetup()
         }
     }
 

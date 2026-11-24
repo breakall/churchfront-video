@@ -699,6 +699,7 @@ struct TrackButton: View {
     let camera: PTZCamera
     @ObservedObject var tracker = AutoTracker.shared
     @ObservedObject var cast = StageCast.shared
+    @ObservedObject private var bridge = CameraBridgeRuntime.shared
     @EnvironmentObject var store: ConfigStore
 
     var body: some View {
@@ -721,6 +722,9 @@ struct TrackButton: View {
             .disabled(CameraPicture.of(camera, store) == nil)
             .help(s == nil ? "Follow the person in the middle of the shot. Or click someone on the Next picture. Moving the joystick stops tracking."
                            : "Stop following. Moving the joystick or recalling a shot also stops it.")
+            if bridge.isManaged(camera.id) {
+                Text(bridge.message).font(.sans(10)).foregroundStyle(T.inkMuted).lineLimit(3)
+            }
             if let s {
                 // The follow shot: tap to reframe. The highlighted one is what it's framing to.
                 HStack(spacing: 2) {

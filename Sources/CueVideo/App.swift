@@ -6,7 +6,10 @@ import CueATEM
 final class Booth: ObservableObject {
     static let shared = Booth()
     let atem = ATEMClient()
-    let ptz = PTZController(load: ProcessInfo.processInfo.environment["CUEVIDEO_FAKECAMS"] == nil)
+    // The setup file installs bridge routing before any camera can claim control.
+    let ptz = PTZController(load: false, linkFactory: { camera, queue in
+        CameraBridgeRuntime.shared.adapter(for: camera, queue: queue)
+    })
     /// The setup, kept in a JSON file people and Claude can edit.
     let store = ConfigStore()
     @Published var simple = UserDefaults.standard.bool(forKey: "simple") { didSet { UserDefaults.standard.set(simple, forKey: "simple") } }
@@ -134,8 +137,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             booth.ptz.cameras = cams
         }
+        booth.ptz.commandFence = { id in CameraBridgeRuntime.shared.commandFence(id) }
         booth.store.attach(booth)
         AutoTracker.shared.attach()
+        AutoTracker.shared.authorizeStart = { id, done in CameraBridgeRuntime.shared.authorizeTracking(id, done: done) }
+        AutoTracker.shared.revokeAuthorization = { id in CameraBridgeRuntime.shared.revokeTracking(id) }
+        CameraBridgeRuntime.shared.onTrackingRevoked = { id in AutoTracker.shared.stop(id) }
         // Claude's way in (through the CueVideo MCP server). Not during self-tests, which
         // may run beside the real app.
         if !booth.store.readOnly { ControlServer.shared.start() }
@@ -157,6 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         AutoTracker.shared.stopAll()
         Booth.shared.ptz.stopAllManual()
+        CameraBridgeRuntime.shared.prepareToQuit()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { sender.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }

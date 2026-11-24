@@ -5,12 +5,18 @@ set -e
 cd "$(dirname "$0")"
 MODE=${1:-release}
 swift build -c $MODE
+swift build --package-path Packages/CameraControlBridge -c $MODE --product camera-control-bridge
 BIN="$(swift build -c $MODE --show-bin-path)/CueVideo"
+BRIDGE_BIN="$(swift build --package-path Packages/CameraControlBridge -c $MODE --show-bin-path)/camera-control-bridge"
 APP="Churchfront Video.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/Helpers" "$APP/Contents/Library/LaunchAgents"
 cp "$BIN" "$APP/Contents/MacOS/CueVideo"
 cp "$(dirname "$BIN")/cuevideo-mcp" "$APP/Contents/MacOS/cuevideo-mcp"
+cp "$BRIDGE_BIN" "$APP/Contents/Helpers/camera-control-bridge"
+cp Resources/LaunchAgents/com.churchfront.cuevideo.camera-bridge.plist "$APP/Contents/Library/LaunchAgents/"
+codesign --force --sign - "$APP/Contents/Helpers/camera-control-bridge"
 cp Resources/Figtree-VariableFont_wght.ttf "$APP/Contents/Resources/"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PLIST

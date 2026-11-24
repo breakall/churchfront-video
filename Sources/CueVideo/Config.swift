@@ -163,10 +163,11 @@ struct CueConfig: Codable, Equatable {
     /// Changes to the follow-shot framing, by size: "shoulders", "waist", "full".
     var framing: [String: FramingRule] = [:]
     var trackTuning = TrackTuning()
+    var cameraBridge = CameraBridgeSettings()
 
     init() {}
 
-    private enum Keys: String, CodingKey { case atemHost, me, sources, cameras, keys, trackSpeed, ptzSpeed, trackTilt, trackZoom, mixNames, pictures, screens, routes, framing, trackTuning }
+    private enum Keys: String, CodingKey { case atemHost, me, sources, cameras, keys, trackSpeed, ptzSpeed, trackTilt, trackZoom, mixNames, pictures, screens, routes, framing, trackTuning, cameraBridge }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -185,6 +186,7 @@ struct CueConfig: Codable, Equatable {
         routes = try c.decodeIfPresent([RouteButton].self, forKey: .routes) ?? []
         framing = try c.decodeIfPresent([String: FramingRule].self, forKey: .framing) ?? [:]
         trackTuning = try c.decodeIfPresent(TrackTuning.self, forKey: .trackTuning) ?? TrackTuning()
+        cameraBridge = try c.decodeIfPresent(CameraBridgeSettings.self, forKey: .cameraBridge) ?? CameraBridgeSettings()
     }
 }
 
@@ -318,6 +320,7 @@ final class ConfigStore: ObservableObject {
         let me = max(0, config.me - 1)
         if b.me != me { b.me = me }
         guard !readOnly else { return }
+        CameraBridgeRuntime.shared.configure(config.cameraBridge, cameras: config.cameras)
         if b.atem.host != config.atemHost { b.atem.connect(config.atemHost) }
         if b.ptz.cameras != config.cameras { b.ptz.cameras = config.cameras }
     }
@@ -389,6 +392,10 @@ final class ConfigStore: ObservableObject {
         c.atemHost = UserDefaults.standard.string(forKey: "atemHost") ?? ""
         c.me = b.me + 1
         c.cameras = b.ptz.cameras
+        if c.cameras.isEmpty, let data = UserDefaults.standard.data(forKey: "ptzCameras"),
+           let cameras = try? JSONDecoder().decode([PTZCamera].self, from: data) {
+            c.cameras = cameras
+        }
         return c
     }
 
