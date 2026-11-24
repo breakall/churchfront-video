@@ -69,7 +69,7 @@ class CameraSimulator:
                 return {"ok": True}
             if path == "fault" and method == "POST":
                 mode = data.get("mode")
-                if mode not in ("delay", "delay_after", "disconnect", "http", "livescope", "malformed"):
+                if mode not in ("delay", "delay_after", "disconnect", "http", "livescope", "malformed", "stream"):
                     raise ValueError("unknown fault mode")
                 endpoint = data.get("endpoint", "*")
                 if endpoint not in ("*", "info.cgi", "control.cgi", "preset/set", "trace/set", "trace/control",
@@ -210,7 +210,24 @@ class CameraSimulator:
                     if fault and fault["mode"] == "delay_after":
                         time.sleep(fault["seconds"])
                     payload = "".join(f"{key}:={value}\n" for key, value in result.items()).encode()
-                    self.reply(200, payload)
+                    if fault and fault["mode"] == "stream":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain;charset=utf-8")
+                        self.send_header("Livescope-Status", "0")
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+
+                        def chunk(data):
+                            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                            self.wfile.flush()
+
+                        chunk(payload)
+                        time.sleep(fault["seconds"])
+                        chunk(b"rig.stream.frame:=2\n")
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    else:
+                        self.reply(200, payload)
                 except ProtocolError as error:
                     simulator.record(endpoint, parameters, self.command, actor, 200, error.status, fingerprint)
                     self.reply(200, str(error).encode(), livescope=error.status)

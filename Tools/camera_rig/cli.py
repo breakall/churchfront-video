@@ -150,7 +150,7 @@ def parser_for_cli():
     advance.add_argument("seconds", type=float)
     fault = commands.add_parser("fault", help="arm a simulated camera failure")
     fault.add_argument("--camera", required=True)
-    fault.add_argument("mode", choices=("http", "livescope", "delay", "delay_after", "disconnect", "malformed"))
+    fault.add_argument("mode", choices=("http", "livescope", "delay", "delay_after", "disconnect", "malformed", "stream"))
     fault.add_argument("--endpoint", default="*")
     fault.add_argument("--code", type=int)
     fault.add_argument("--seconds", type=float, default=0.1)
@@ -163,6 +163,11 @@ def parser_for_cli():
             command.add_argument("--camera", required=True, help="simulated camera's inspection URL")
         else:
             command.add_argument("--ownership", choices=("documented", "exclusive"), default="documented")
+    bridge = commands.add_parser("bridge-test", help="launch and verify an actual bridge executable")
+    bridge.add_argument("--bridge-binary", required=True)
+    bridge.add_argument("--ownership", choices=("both", "documented", "exclusive"), default="both")
+    bridge.add_argument("--transport-only", action="store_true", help="run the first forwarding milestone only")
+    bridge.add_argument("--output", default=".camera-rig/bridge-report.json")
     return parser
 
 
@@ -209,7 +214,10 @@ def main(argv=None):
                     result = admin.admin("fault", data)
                 print(json.dumps(result, indent=2, ensure_ascii=False))
                 return 0
-        if args.command == "selftest":
+        if args.command == "bridge-test":
+            from .bridge_scenarios import verify_bridge
+            report = verify_bridge(args.bridge_binary, ownership=args.ownership, transport_only=args.transport_only)
+        elif args.command == "selftest":
             with CameraSimulator(clock="manual", ownership=args.ownership) as camera:
                 report = verify(camera.url, camera.url)
         else:
@@ -220,7 +228,7 @@ def main(argv=None):
             if not check["passed"]:
                 print("  " + check["error"])
         print(f"Report: {Path(args.output).resolve()}")
-        print("Scope: network transport; Churchfront tracking handoff is not yet under test.")
+        print("Scope: " + report["mode"] + "; actual Churchfront tracking adapter is not yet under test.")
         return 0 if report["passed"] else 1
     except KeyboardInterrupt:
         return 130

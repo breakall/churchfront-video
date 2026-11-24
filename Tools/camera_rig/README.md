@@ -90,6 +90,19 @@ python3 Tools/camera-rig.py controller --target http://127.0.0.1:18081 --session
 
 ## Test the bridge as it is implemented
 
+For the native Swift helper, `bridge-test` starts the actual executable, temporary cameras, and independent controller/app test clients. Pass the path to an already built helper:
+
+```sh
+python3 Tools/camera-rig.py bridge-test --bridge-binary /absolute/path/to/camera-control-bridge --transport-only --output .camera-rig/helper-transport.json
+python3 Tools/camera-rig.py bridge-test --bridge-binary /absolute/path/to/camera-control-bridge --output .camera-rig/helper-ownership.json
+```
+
+The first command checks all six transport scenarios in both camera ownership profiles. The full run adds checks at the helper's authenticated app interface: manual takeover and stale command/stop rejection, explicit restart, independently held axes and travel limits, zoom speed zero, control connection closure, each focus/preset/trace trigger, read-only traffic, app disconnection and lease expiry, camera failure without replay, interface authentication/version checks, and diagnostics defaults/redaction/opt-out. It also checks in-flight writes, pending physical actions, ambiguous movement outcomes, malformed messages, streaming information, concurrent stop/disconnect, cleanup failures and unavailable diagnostic storage. Each policy case gets a fresh helper and camera. Most use the documented sessionless-command profile; a separate exclusive-profile case checks that camera-session recovery never steals the hardware controller's control. The runner owns and shuts down only the helper processes it launches.
+
+These checks observe the real helper and simulated camera, using an independent Python app client rather than the Swift client library. Reports include the executable's SHA-256, camera requests and sanitized app-interface observations, including authorization generations and rejected command statuses. `helper_ownership_verified` reports that focused result; `tracking_handoff_verified` remains false because the running Churchfront adapter and UI are a separate integration milestone. Native tracking grammar and physical-camera interoperability are not inferred from these tests.
+
+Software-purpose checks preserve Churchfront's existing distinction between software zoom/focus and manual camera movement. Ordinary software controls keep tracking authorization; an explicit software pan, position, home or preset movement disables it atomically and accepts subsequent software release commands with the same lease. The exposure case checks forwarding and authorization against an intentional unsupported-parameter camera reply; it does not validate exposure behavior. A separate crash/restart case reuses the same helper configuration and credentials while a physical joystick is held at a travel limit. Fresh telemetry alone must not clear that recovery fence; explicit physical stops and a later tracking start are required.
+
 The intended arrangement is:
 
 ```text
@@ -125,6 +138,7 @@ Available modes:
 | `malformed` | Send an invalid HTTP response without applying the command. |
 | `delay` | Wait before applying the command and replying. |
 | `delay_after` | Apply the command, then wait before replying. |
+| `stream` | Send a snapshot HTTP chunk immediately, wait, then send a synthetic second chunk and terminate. This is a streaming transport fixture, not a claim about Canon event grammar. |
 
 Use `--seconds` for delays, `--count` for repeated faults, and `--endpoint` to restrict the fault. Delays are limited to 3 seconds, counts to 20 per fault, and queued fault rules to 32. For example:
 
@@ -163,7 +177,7 @@ Two ownership profiles are provided:
 | `documented` (default) | Allows supported sessionless camera commands and models control claims separately. Canon's documented remote-camera behavior does not make every ordinary command contingent on holding exclusive control. |
 | `exclusive` | Deliberately adversarial profile: another session can steal control, and writes from a nonowner return status 301. This exercises contention handling; it is not a claim that every real Canon camera behaves this way. |
 
-Motion and optics are simplified. Preset recall and trace preparation move instantly; trace playback requires preparation in this profile. Trace focus actions are recorded, but lens physics and video are not simulated. Stores are in memory and disappear on reset or exit. Stored preset/trace deletion and selective preset content are unsupported. This version does not model HTTP authentication, streaming information responses, discovery, preview video, or ATEM behavior.
+Motion and optics are simplified. Preset recall and trace preparation move instantly; trace playback requires preparation in this profile. Trace focus actions are recorded, but lens physics and video are not simulated. Stores are in memory and disappear on reset or exit. Stored preset/trace deletion and selective preset content are unsupported. This version does not model HTTP authentication, Canon-specific streaming event semantics, discovery, preview video, or ATEM behavior. The `stream` fault supplies synthetic chunked HTTP solely to verify incremental forwarding and concurrent control.
 
 The virtual controller generates the supported request subset; it is not a firmware clone. Exact RC-IP100 request sequences, controller timeouts, and the native auto-tracking button's wire commands still require captures from the real equipment. No guessed native tracking endpoint is presented as Canon behavior. Captured, sanitized fixtures can be added to this profile when available.
 
@@ -178,5 +192,6 @@ The camera binds only to `127.0.0.1`. Controller and scenario targets must be lo
 | `camera.py` | HTTP server, inspection API, faults, and request journal. |
 | `model.py` | Simulated camera state and deterministic clock. |
 | `scenarios.py` | Reusable network verification scenarios and report scope. |
+| `bridge_scenarios.py` | Launch the actual helper and exercise its controller/app interfaces independently. |
 | `cli.py` | Commands, interactive shell, and atomic report writing. |
 | `tests/` | Utility tests and independent healthy/broken relay fixtures. |
