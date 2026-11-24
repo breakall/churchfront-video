@@ -4,6 +4,7 @@ The bridge gives the RC-IP100 priority over Churchfront tracking for one Canon C
 
 These documents are maintained with the implementation in this fork:
 
+- [Equipment Mac installation and rehearsal](equipment-mac-setup.md): download, install, configure the physical route and restore the original setup.
 - [Business requirements](business-requirements.md): existing behavior, the problem, and the required operator experience.
 - [Implementation plan](implementation-plan.md): architecture, milestones, current progress, and verification limited to our additions.
 - [Features and settings](camera-control-settings.md): defaults, options, and remaining decisions.

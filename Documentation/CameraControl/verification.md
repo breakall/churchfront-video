@@ -77,3 +77,11 @@ On November 24, 2026, an isolated copy of the actual Churchfront app ran with it
 Evidence: `.camera-rig/tracking-ui-report.json`, `tracking-before.json`, `tracking-after.json` and `tracking-after-release.json`. The backend verifier is read-only and marks its UI scope as unverified; the separate combined report records the actual accessibility-tree and screenshot observations. The [test rig guide](../../Tools/camera_rig/README.md#actual-app-tracking-takeover-evidence) describes reuse.
 
 This proves the added tracking handoff and visible-state integration in the actual application with simulators. The fixed image does not respond to simulated motion; tracking accuracy, real RC-IP100 firmware exchanges and camera interoperability still require equipment rehearsal.
+
+## Downloadable equipment build
+
+The `camera-bridge-bench-1` prerelease packages a universal release build made with `./build.sh release universal`. The app, MCP executable and helper each contain `arm64` and `x86_64` slices with a macOS 14.0 minimum. Deep strict signature verification, both plist checks and the embedded-font check passed. An extracted copy of the ZIP retained all file hashes, executable permissions, valid signatures and self-contained font resources.
+
+The exact signed universal helper passed all 57 process-level simulator checks on Apple silicon. Its SHA-256 is `3368e168ad32c0202bc8f2e4de37a585499a03f461079eb85f33de7da0d21eb3`. Evidence is in `.camera-rig/universal-release-helper-verification.json` and `.camera-rig/universal-release-bundle-verification.json`. The earlier actual-app UI rehearsal used the development build of the same app/bridge source; this packaging check does not repeat it. Intel execution, the equipment Mac's background-service approval and real camera/controller interoperability remain target-Mac checks.
+
+The download includes the helper in the app bundle; it needs no separate helper installer or development tools. The build uses ad hoc signatures and has no Apple notarization. The [equipment Mac guide](equipment-mac-setup.md) covers download, first launch, profile backup, network configuration, focused rehearsal and rollback.

@@ -4,6 +4,9 @@ A simple ATEM control surface for church booths, with PTZ camera control and liv
 camera previews. Part of the Churchfront App Suite (Churchfront Cues, Churchfront Screens,
 Churchfront Lights, Churchfront Tracks). Native macOS 14+, SwiftUI.
 
+This fork adds an RC-IP100 camera-control bridge. For its downloadable test app and
+equipment-Mac setup, see the [installation and rehearsal guide](Documentation/CameraControl/equipment-mac-setup.md).
+
 - `Sources/CueATEM`: the shared engine. `ATEM.swift` speaks the ATEM network
   protocol (UDP 9910) with two-way state; `PTZ.swift` drives Canon cameras over
   Canon's HTTP control and VISCA cameras (VISCA over IP UDP 52381, or VISCA over

@@ -1,13 +1,25 @@
 #!/bin/zsh
 # Builds "Churchfront Video.app" (release) next to this script.
+# ./build.sh release universal includes Apple silicon and Intel executables.
 # The executable inside, the bundle ID and the MCP binary keep their CueVideo names on purpose.
 set -e
 cd "$(dirname "$0")"
 MODE=${1:-release}
-swift build -c $MODE
-swift build --package-path Packages/CameraControlBridge -c $MODE --product camera-control-bridge
-BIN="$(swift build -c $MODE --show-bin-path)/CueVideo"
-BRIDGE_BIN="$(swift build --package-path Packages/CameraControlBridge -c $MODE --show-bin-path)/camera-control-bridge"
+SWIFT_ARGS=(-c "$MODE")
+if [[ $# -gt 2 ]]; then
+  echo "Usage: ./build.sh [release|debug] [universal]" >&2
+  exit 1
+fi
+if [[ "${2:-}" == "universal" ]]; then
+  SWIFT_ARGS+=(--arch arm64 --arch x86_64)
+elif [[ -n "${2:-}" ]]; then
+  echo "Usage: ./build.sh [release|debug] [universal]" >&2
+  exit 1
+fi
+swift build "${SWIFT_ARGS[@]}"
+swift build --package-path Packages/CameraControlBridge "${SWIFT_ARGS[@]}" --product camera-control-bridge
+BIN="$(swift build "${SWIFT_ARGS[@]}" --show-bin-path)/CueVideo"
+BRIDGE_BIN="$(swift build --package-path Packages/CameraControlBridge "${SWIFT_ARGS[@]}" --show-bin-path)/camera-control-bridge"
 APP="Churchfront Video.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
