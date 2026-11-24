@@ -28,7 +28,7 @@ The implementation repository is the [breakall/churchfront-video fork](https://g
 | Native tracking translation and app/helper packaging | Development bundle builds and signature/plist checks pass. An isolated SMAppService owner passed ten service checks on this Mac, including quit/crash, automatic restart and cleanup. Production app/profile activation on the booth Mac remains untested. Native translation remains unavailable pending real request/capability evidence. |
 | Physical camera/controller interoperability and rehearsal | Pending equipment access. No real-camera interoperability has been established by the simulator. |
 
-Actual unavailable-message/Start bridge UI rehearsal remains pending an unlocked screen; its isolated startup found and fixed a missing dependency-resource packaging issue.
+Actual unavailable-message/Start bridge UI rehearsal passed on this Mac with a simulator. The routing option remained enabled during service loss; the visible message, enabled Start bridge button, actual click/reconnection, camera forwarding and cleanup were verified. The cold-start dependency-resource packaging check also passes.
 
 Detailed evidence, exact helper build identity, reproduction commands and remaining target-Mac checks are in the [verification record](verification.md). Camera-preset deletion from the app is unavailable in bridge mode until its separate privileged session path can be mediated safely; physical controller preset/trace operations are implemented.
 
@@ -172,7 +172,7 @@ Implement authorization, purpose/generation checks, bounded queues, physical pri
 
 **Exit:** focused ownership tests prove revocation, stale rejection, physical priority and no automatic reauthorization. Measure overhead against D05 limits.
 
-### Phase 4 Integrate minimally with Churchfront — focused contracts checked
+### Phase 4 Integrate minimally with Churchfront — focused contracts and recovery UI checked
 
 Attach adapters to actual app code. Extend the bench with adapter contract checks showing that representative requests cross the new seam, hardware events invoke the existing stop immediately, existing starts cross authorization, and existing state reaches the new status interface. Include separate changed claim/stop paths and shutdown. The transport report alone cannot establish that Churchfront tracking is disabled; this milestone needs evidence from the actual changed adapter.
 
