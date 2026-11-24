@@ -17,7 +17,8 @@ cp "$(dirname "$BIN")/cuevideo-mcp" "$APP/Contents/MacOS/cuevideo-mcp"
 cp "$BRIDGE_BIN" "$APP/Contents/Helpers/camera-control-bridge"
 cp Resources/LaunchAgents/com.churchfront.cuevideo.camera-bridge.plist "$APP/Contents/Library/LaunchAgents/"
 codesign --force --sign - "$APP/Contents/Helpers/camera-control-bridge"
-cp Resources/Figtree-VariableFont_wght.ttf "$APP/Contents/Resources/"
+cp -R "$(dirname "$BIN")/CueKit_CueDesign.bundle" "$APP/Contents/Resources/"
+swift Tools/check-app-resources.swift "$APP" "$(dirname "$BIN")/CueKit_CueDesign.bundle"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

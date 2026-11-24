@@ -27,7 +27,9 @@ struct ServiceBenchRegistrar {
             guard let action = arguments.first,
                   Bundle.main.bundleURL.pathExtension == "app",
                   let plist = Bundle.main.object(forInfoDictionaryKey: "CameraBridgeBenchAgentPlist") as? String,
-                  plist.hasPrefix("com.churchfront.cuevideo.camera-bridge.bench.") else {
+                  Bundle.main.bundleIdentifier?.hasPrefix("com.churchfront.cuevideo.camera-bridge.bench.") == true,
+                  (plist.hasPrefix("com.churchfront.cuevideo.camera-bridge.bench.") ||
+                   plist == "com.churchfront.cuevideo.camera-bridge.plist") else {
                 throw BenchError("Run from the isolated bench application bundle.")
             }
             let service = SMAppService.agent(plistName: plist)

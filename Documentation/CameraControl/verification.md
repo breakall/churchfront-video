@@ -46,3 +46,11 @@ The reusable bench copied the signed helper into an isolated owner application a
 A launchd-specific executable-identity bug was reproduced and fixed. The service now hashes its actual loaded executable rather than relative `argv[0]`; readiness is checked against the signed image. The updated bundled helper also passes all 57 existing helper checks.
 
 Evidence: `.camera-rig/background-service-verification.json`. All ten checks passed, and cleanup was independently confirmed with `notRegistered`, no test launchd job, and no surviving helper. This verifies the service fixture and real helper, not an end-to-end Churchfront UI/tracking session.
+
+## Actual app UI recovery rehearsal — pending
+
+An isolated copy of the real Churchfront application was prepared with a loopback camera, separate app identity/service label and a temporary profile. Its first cold launch stalled before bridge initialization: the app bundle omitted `CueKit_CueDesign.bundle`, and font lookup reached a protected developer-source directory before the flat-font fallback. Including the dependency resource bundle cleared the stall; the actual app connected to the simulated helper. `build.sh` now packages that complete bundle and checks that Foundation resolves the matching font inside the app. The artifact check failed before the fix and passes afterward.
+
+The Mac screen was locked, and the user could not unlock it. The unavailable message was therefore not visually observed and Start bridge was not clicked. This UI test is explicitly pending; the backend and earlier service checks do not substitute for that evidence. The temporary app, helper and simulator were stopped, the isolated service was unregistered, the original absent profile was restored, and the fixture was removed. Local report: `.camera-rig/ui-recovery-report.json`.
+
+On an unlocked Mac, repeat with an isolated simulator profile, observe the actual unavailable message, click Start bridge, and confirm the actual app reconnects. Then use `python3 -m camera_rig.ui_bench_backend` with `PYTHONPATH=Tools` to verify camera movement and release without replacing the real app's lease. This module independently records backend evidence and always leaves visible UI verification to the UI observer.
