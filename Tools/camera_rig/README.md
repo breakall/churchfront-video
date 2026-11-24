@@ -88,6 +88,38 @@ python3 Tools/camera-rig.py controller --target http://127.0.0.1:18081 --session
 
 `--actor software` labels a second test client in diagnostics. This is a test label, not authentication or a production method of identifying physical-controller activity.
 
+## Optional preview for the actual app
+
+To exercise Churchfront's real tracking state and indicator with a deterministic person image:
+
+```sh
+python3 Tools/camera-rig.py camera --port 18081 --clock manual --preview-image Tools/camera_rig/fixtures/public-domain-person.jpg
+```
+
+With this explicit option, `/-wvhttp-01-/video.cgi` supplies a multipart JPEG preview at 10 frames per second, matching the endpoint used by the app's existing Canon preview reader. Input is limited to a regular JPEG of at most 2 MiB, loaded once. Up to four preview clients are accepted. Each connection adds one journal entry; frames do not evict control-command evidence. Camera control remains independent of the preview stream, and stopping the simulator closes preview streams.
+
+The default simulator still has no preview. The [photo provenance](fixtures/README.md) records its public-domain source and fixture limits. The image stays static when simulated camera coordinates change; this adds input for the actual tracking/manual-takeover UI test, not a model of optics or a tracking-quality benchmark.
+
+### Actual app tracking takeover evidence
+
+Use an isolated test app/service identity and temporary app profile; preserve any existing profile and tracking log before running the actual app. Configure its Canon camera to the preview simulator, enable bridge routing, and point the simulated controller at the helper's physical port. To supply ATEM Next/Live state locally, run the existing simulator bound to loopback:
+
+```sh
+PYTHONPATH=Tools python3 -c "from fake_atem import Switcher; Switcher(host='127.0.0.1').run()"
+```
+
+It listens on UDP 9910, with input 1 on Live and input 2 on Next. Configure the app's ATEM host as `127.0.0.1` and map the Canon camera to input 2. Start tracking through the actual app's Track button. Observe TRACKING, FOLLOWING and the tracking-control message before recording the baseline:
+
+```sh
+PYTHONPATH=Tools python3 -m camera_rig.tracking_ui_backend --phase before --camera http://127.0.0.1:18081 --helper-ready "$HOME/Library/Application Support/CueVideo/CameraBridge/ready.json" --control-token-file "$HOME/Library/Application Support/CueVideo/control-token" --output .camera-rig/tracking-before.json
+```
+
+Send a physical joystick command through the helper using the controller utility. Observe TRACK, disappearance of FOLLOWING and **Manual control. Tracking is off.** in the actual app. Then run the same verifier with `--phase after --baseline .camera-rig/tracking-before.json --output .camera-rig/tracking-after.json` and the same camera/ready/token arguments. Explicitly stop all physical axes and confirm tracking remains off afterward.
+
+The verifier only reads the actual app's authenticated loopback `get_status`, helper status and camera journal. It never starts/stops tracking, replaces the app's connection or generates camera commands. Its after checks require the actual session to stop, helper authorization to be revoked, generation to advance, the app connection to remain attached, and a new physical command to reach the camera. Connection identities are hashed and tokens omitted from its reports. UI observation remains separate; backend success alone is not UI evidence.
+
+Afterward, unregister the isolated service, quit the test app and simulators, restore the original profile/log state and verify cleanup. The completed rehearsal is recorded in [verification.md](../../Documentation/CameraControl/verification.md#actual-app-tracking-takeover-rehearsal--passed).
+
 ## Test the bridge as it is implemented
 
 For the native Swift helper, `bridge-test` starts the actual executable, temporary cameras, and independent controller/app test clients. Pass the path to an already built helper:
@@ -177,7 +209,7 @@ Two ownership profiles are provided:
 | `documented` (default) | Allows supported sessionless camera commands and models control claims separately. Canon's documented remote-camera behavior does not make every ordinary command contingent on holding exclusive control. |
 | `exclusive` | Deliberately adversarial profile: another session can steal control, and writes from a nonowner return status 301. This exercises contention handling; it is not a claim that every real Canon camera behaves this way. |
 
-Motion and optics are simplified. Preset recall and trace preparation move instantly; trace playback requires preparation in this profile. Trace focus actions are recorded, but lens physics and video are not simulated. Stores are in memory and disappear on reset or exit. Stored preset/trace deletion and selective preset content are unsupported. This version does not model HTTP authentication, Canon-specific streaming event semantics, discovery, preview video, or ATEM behavior. The `stream` fault supplies synthetic chunked HTTP solely to verify incremental forwarding and concurrent control.
+Motion and optics are simplified. Preset recall and trace preparation move instantly; trace playback requires preparation in this profile. Trace focus actions are recorded, but lens physics are not simulated. Stores are in memory and disappear on reset or exit. Stored preset/trace deletion and selective preset content are unsupported. This version does not model HTTP authentication, Canon-specific streaming event semantics, discovery, or ATEM behavior. The optional preview repeats a fixed JPEG without modeling camera motion. The `stream` fault supplies synthetic chunked HTTP solely to verify incremental forwarding and concurrent control.
 
 The virtual controller generates the supported request subset; it is not a firmware clone. Exact RC-IP100 request sequences, controller timeouts, and the native auto-tracking button's wire commands still require captures from the real equipment. No guessed native tracking endpoint is presented as Canon behavior. Captured, sanitized fixtures can be added to this profile when available.
 
@@ -193,5 +225,7 @@ The camera binds only to `127.0.0.1`. Controller and scenario targets must be lo
 | `model.py` | Simulated camera state and deterministic clock. |
 | `scenarios.py` | Reusable network verification scenarios and report scope. |
 | `bridge_scenarios.py` | Launch the actual helper and exercise its controller/app interfaces independently. |
+| `tracking_ui_backend.py` | Read-only before/after evidence for actual app tracking takeover; UI is observed separately. |
+| `fixtures/` | Documented public-domain person JPEG for opt-in preview. |
 | `cli.py` | Commands, interactive shell, and atomic report writing. |
 | `tests/` | Utility tests and independent healthy/broken relay fixtures. |

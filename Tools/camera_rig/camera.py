@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import deque
 import hashlib
 import json
+from pathlib import Path
 import socket
 import threading
 import time
@@ -14,7 +15,7 @@ from .model import CameraModel, ProtocolError
 
 
 class CameraSimulator:
-    def __init__(self, *, clock="manual", port=0, ownership="documented"):
+    def __init__(self, *, clock="manual", port=0, ownership="documented", preview_image=None):
         self.clock = clock
         self.port = port
         self.server = None
@@ -25,6 +26,19 @@ class CameraSimulator:
         self.sequence = 0
         self.faults = []
         self.run_id = uuid.uuid4().hex
+        self.preview = None
+        if preview_image is not None:
+            path = Path(preview_image)
+            if not path.is_file() or not 4 <= path.stat().st_size <= 2_097_152:
+                raise ValueError("preview image must be a regular JPEG file of at most 2 MiB")
+            with path.open("rb") as stream:
+                self.preview = stream.read(2_097_153)
+            if len(self.preview) > 2_097_152:
+                raise ValueError("preview image exceeds 2 MiB")
+            if not self.preview.startswith(b"\xff\xd8") or not self.preview.endswith(b"\xff\xd9"):
+                raise ValueError("preview image must contain a JPEG")
+        self.preview_stop = threading.Event()
+        self.preview_slots = threading.BoundedSemaphore(4)
 
     def record(self, endpoint, parameters, method, actor, status, livescope, fingerprint, fault=None):
         allowed = {"pan", "tilt", "zoom", "pan.speed", "tilt.speed", "zoom.speed",
@@ -45,7 +59,8 @@ class CameraSimulator:
             self.model.tick()
             if path == "meta" and method == "GET":
                 return {"kind": "canon-camera-test-rig", "version": 1, "run_id": self.run_id,
-                        "clock": self.clock, "ownership": self.model.ownership}
+                        "clock": self.clock, "ownership": self.model.ownership,
+                        "preview_enabled": self.preview is not None}
             if path == "state" and method == "GET":
                 return {"info": self.model.info(), "commanded_axes":
                         [axis for axis, value in self.model.velocity.items() if value],
@@ -106,6 +121,7 @@ class CameraSimulator:
 
     def __enter__(self):
         simulator = self
+        self.preview_stop.clear()
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -151,6 +167,9 @@ class CameraSimulator:
                         return
                     endpoint = parsed.path.removeprefix("/-wvhttp-01-/")
                     fingerprint = hashlib.sha256(self.path.encode() + b"\x00" + body).hexdigest()
+                    if endpoint == "video.cgi" and simulator.preview is not None:
+                        self.preview(actor, fingerprint)
+                        return
                     pairs = parse_qsl(parsed.query, keep_blank_values=True)
                     if body:
                         pairs += parse_qsl(body.decode("ascii"), keep_blank_values=True)
@@ -240,6 +259,34 @@ class CameraSimulator:
             do_GET = handle_request
             do_POST = handle_request
 
+            def preview(self, actor, fingerprint):
+                self.close_connection = True
+                if self.command != "GET":
+                    self.reply(405, b"Preview requires GET\n", livescope="401")
+                    return
+                if not simulator.preview_slots.acquire(blocking=False):
+                    self.reply(503, b"Preview client limit reached\n", livescope="408")
+                    return
+                try:
+                    # One journal entry per connection, never per frame: the
+                    # preview cannot evict command-order evidence at video rate.
+                    simulator.record("video.cgi", {}, "GET", actor, 200, "0", fingerprint)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=camera-rig")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Livescope-Status", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    frame = (b"--camera-rig\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                             + str(len(simulator.preview)).encode() + b"\r\n\r\n"
+                             + simulator.preview + b"\r\n")
+                    while not simulator.preview_stop.is_set():
+                        self.wfile.write(frame)
+                        self.wfile.flush()
+                        simulator.preview_stop.wait(0.1)
+                finally:
+                    simulator.preview_slots.release()
+
             def handle(self):
                 try:
                     super().handle()
@@ -259,6 +306,7 @@ class CameraSimulator:
         return self
 
     def __exit__(self, *args):
+        self.preview_stop.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)

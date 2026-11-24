@@ -21,7 +21,7 @@ The implementation repository is the [breakall/churchfront-video fork](https://g
 | Deliverable | Status and evidence |
 | --- | --- |
 | Fork and upstream relationship | Complete. Fork created, upstream baseline retained, and test utility pushed to `main`. |
-| Standalone controller/camera test rig | Complete. All 28 utility tests pass, including independently launched camera/controller programs. All six baseline scenarios pass in both simulator ownership profiles. |
+| Standalone controller/camera test rig | Complete. All 30 utility tests pass, including independently launched camera/controller programs and opt-in preview streaming. All six baseline scenarios pass in both simulator ownership profiles. |
 | External-target verification | Complete for the supported simulated transport profile. A separate healthy relay passes; deliberately dropped preset stores and swallowed joystick stops fail the corresponding checks. JSON reports retain request evidence. |
 | Production Swift bridge helper | Implemented as a native development helper. Its signed bundled executable passes 57 process-level transport, ownership, streaming and failure/recovery checks. |
 | Ownership arbitration and Churchfront adapters | Implemented. Fourteen app contract checks and two PTZ routing/fence checks pass. Helper checks remain distinct from live tracking behavior and equipment interoperability. |
@@ -29,6 +29,8 @@ The implementation repository is the [breakall/churchfront-video fork](https://g
 | Physical camera/controller interoperability and rehearsal | Pending equipment access. No real-camera interoperability has been established by the simulator. |
 
 Actual unavailable-message/Start bridge UI rehearsal passed on this Mac with a simulator. The routing option remained enabled during service loss; the visible message, enabled Start bridge button, actual click/reconnection, camera forwarding and cleanup were verified. The cold-start dependency-resource packaging check also passes.
+
+Actual tracking takeover and indicator rehearsal also passed with loopback camera/controller/ATEM simulators. A physical joystick command stopped an existing `following` session in the real app, changed TRACKING to TRACK, removed FOLLOWING and displayed the manual-control message. The same app connection remained attached, physical forwarding succeeded, and tracking stayed off after explicit release. Temporary service, app, profile and log changes were cleaned up.
 
 Detailed evidence, exact helper build identity, reproduction commands and remaining target-Mac checks are in the [verification record](verification.md). Camera-preset deletion from the app is unavailable in bridge mode until its separate privileged session path can be mediated safely; physical controller preset/trace operations are implemented.
 
@@ -172,7 +174,7 @@ Implement authorization, purpose/generation checks, bounded queues, physical pri
 
 **Exit:** focused ownership tests prove revocation, stale rejection, physical priority and no automatic reauthorization. Measure overhead against D05 limits.
 
-### Phase 4 Integrate minimally with Churchfront — focused contracts and recovery UI checked
+### Phase 4 Integrate minimally with Churchfront — focused contracts, recovery UI and tracking takeover checked
 
 Attach adapters to actual app code. Extend the bench with adapter contract checks showing that representative requests cross the new seam, hardware events invoke the existing stop immediately, existing starts cross authorization, and existing state reaches the new status interface. Include separate changed claim/stop paths and shutdown. The transport report alone cannot establish that Churchfront tracking is disabled; this milestone needs evidence from the actual changed adapter.
 

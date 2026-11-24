@@ -136,6 +136,7 @@ def parser_for_cli():
     camera.add_argument("--clock", choices=("manual", "realtime"), default="realtime")
     camera.add_argument("--ownership", choices=("documented", "exclusive"), default="documented")
     camera.add_argument("--ready-file")
+    camera.add_argument("--preview-image", help="opt-in JPEG fixture streamed to the real app's Canon preview")
     control = commands.add_parser("controller", help="send controller actions or open an interactive shell")
     control.add_argument("--target", required=True)
     control.add_argument("--actor", choices=("controller", "software"), default="controller")
@@ -180,9 +181,11 @@ def main(argv=None):
             stop = threading.Event()
             old_handler = signal.signal(signal.SIGTERM, lambda *_: stop.set())
             try:
-                with CameraSimulator(clock=args.clock, port=args.port, ownership=args.ownership) as camera:
+                with CameraSimulator(clock=args.clock, port=args.port, ownership=args.ownership,
+                                     preview_image=args.preview_image) as camera:
                     ready = {"event": "camera_ready", "url": camera.url, "clock": args.clock,
-                             "ownership": args.ownership, "simulated": True}
+                             "ownership": args.ownership, "simulated": True,
+                             "preview_enabled": args.preview_image is not None}
                     if args.ready_file:
                         write_json(args.ready_file, ready)
                     print(json.dumps(ready), flush=True)

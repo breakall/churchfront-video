@@ -4,12 +4,13 @@ Verified November 24, 2026 against the development application bundle and its ac
 
 | Check | Result |
 | --- | --- |
-| Standalone camera/controller utility | 28 tests passed. |
+| Standalone camera/controller utility | 30 tests passed, including opt-in preview streaming alongside camera control. |
 | Helper configuration guards | 3 Swift tests passed. |
 | Actual helper process | 57 checks passed: 12 transport checks and 45 ownership, recovery, streaming, diagnostics and failure checks. |
 | App client, settings, export and tracking hooks | 14 focused tests passed. |
 | PTZ adapter routing and queued-command fencing | 2 focused tests passed. |
 | Isolated macOS background service | 10 actual `SMAppService`/launchd simulator checks passed, including app quit/crash, automatic helper restart, image identity and verified cleanup. |
+| Actual Churchfront tracking takeover and indicator | Passed with simulators: real tracking session stopped, visible indicator updated, physical command forwarded, and tracking remained off after release. |
 | Complete development bundle | `./build.sh debug` succeeded. |
 | Signatures and metadata | `codesign --verify --deep --strict` and both embedded plist checks passed. |
 
@@ -62,3 +63,17 @@ Observed sequence in Setup → Cameras → Physical camera controller:
 Reports: `.camera-rig/ui-recovery-report.json` and `.camera-rig/ui-recovery-backend.json`. Both the visible message and the button action are verified; the backend report retains its separate scope flag so it cannot be mistaken for UI evidence on its own. The Mac's original service/profile state was restored.
 
 The earlier cold-start resource packaging defect is fixed: the complete dependency resource bundle is embedded, and the build checks that Foundation resolves its matching font from inside the app. This rehearsal verifies the requested unavailable-message/start-button workflow, not real equipment, tracking image processing, or every application workflow.
+
+## Actual app tracking takeover rehearsal — passed
+
+On November 24, 2026, an isolated copy of the actual Churchfront app ran with its production tracking engine, app adapters and signed background helper. Loopback simulators supplied the Canon camera, RC-IP100 command subset and ATEM. The camera's opt-in MJPEG preview repeated a documented public-domain person image; the existing app detected and followed it. No tracking-state injection or replacement app lease was used.
+
+1. Clicking the actual **TRACK** button produced **TRACKING**, a **FOLLOWING** badge and **Tracking has control.** The app's read-only status reported `following`, and the helper authorized that actual app connection at generation 2.
+2. The simulated RC-IP100 opened/claimed the helper's physical port and sent a joystick-right command. The actual app changed back to **TRACK**, removed **FOLLOWING**, and displayed **Manual control. Tracking is off. Or click a person on Next**.
+3. Independent observations confirmed that the actual app tracking session became `false`, helper authorization was revoked with a newer generation and physical-takeover flag, the same app connection remained attached, and the physical command reached the simulated camera.
+4. Explicit physical pan/tilt, zoom and focus stops cleared the held axes. A subsequent status check still showed tracking off and authorization revoked; release did not restart tracking.
+5. The isolated helper was unregistered and its app terminated. Native checks confirmed no test launchd job, app/helper process or test listener remained. Both simulators, temporary bundle, profile and preferences were removed, and the Mac's original tracking-log state was restored.
+
+Evidence: `.camera-rig/tracking-ui-report.json`, `tracking-before.json`, `tracking-after.json` and `tracking-after-release.json`. The backend verifier is read-only and marks its UI scope as unverified; the separate combined report records the actual accessibility-tree and screenshot observations. The [test rig guide](../../Tools/camera_rig/README.md#actual-app-tracking-takeover-evidence) describes reuse.
+
+This proves the added tracking handoff and visible-state integration in the actual application with simulators. The fixed image does not respond to simulated motion; tracking accuracy, real RC-IP100 firmware exchanges and camera interoperability still require equipment rehearsal.

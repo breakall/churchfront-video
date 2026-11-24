@@ -22,9 +22,9 @@ INPUTS = {0: ("Black", "BLK"), 1: ("Center Camera", "CAM1"), 2: ("Left Camera", 
           7001: ("Clean Feed 1", "CFD1"), 10010: ("Program", "PGM"), 10011: ("Preview", "PVW")}
 
 class Switcher:
-    def __init__(self):
+    def __init__(self, *, host="0.0.0.0"):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("0.0.0.0", PORT))
+        self.sock.bind((host, PORT))
         self.lock = threading.Lock()
         self.client = None
         self.pid = 0
