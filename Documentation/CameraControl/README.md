@@ -25,3 +25,5 @@ Supporting research records the evidence available before implementation. Curren
 - [Churchfront source investigation](churchfront-source-research.md).
 
 The native tracking button's command and capability exchanges require real-controller evidence. They are not inferred from autofocus commands or mapped onto a preset button.
+
+To exercise actual macOS background-service registration with isolated simulator data, run `python3 Tools/service-bench.py`. This registers and removes a separate test service; it does not alter the production service. See the [service-bench guide](../../Tools/service_bench/README.md).

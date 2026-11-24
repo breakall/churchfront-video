@@ -25,7 +25,7 @@ The implementation repository is the [breakall/churchfront-video fork](https://g
 | External-target verification | Complete for the supported simulated transport profile. A separate healthy relay passes; deliberately dropped preset stores and swallowed joystick stops fail the corresponding checks. JSON reports retain request evidence. |
 | Production Swift bridge helper | Implemented as a native development helper. Its signed bundled executable passes 57 process-level transport, ownership, streaming and failure/recovery checks. |
 | Ownership arbitration and Churchfront adapters | Implemented. Fourteen app contract checks and two PTZ routing/fence checks pass. Helper checks remain distinct from live tracking behavior and equipment interoperability. |
-| Native tracking translation and app/helper packaging | Development bundle builds and signature/plist checks pass. Host background-item activation is not exercised. Native translation remains unavailable pending real request/capability evidence. |
+| Native tracking translation and app/helper packaging | Development bundle builds and signature/plist checks pass. An isolated SMAppService owner passed ten service checks on this Mac, including quit/crash, automatic restart and cleanup. Production app/profile activation on the booth Mac remains untested. Native translation remains unavailable pending real request/capability evidence. |
 | Physical camera/controller interoperability and rehearsal | Pending equipment access. No real-camera interoperability has been established by the simulator. |
 
 Detailed evidence, exact helper build identity, reproduction commands and remaining target-Mac checks are in the [verification record](verification.md). Camera-preset deletion from the app is unavailable in bridge mode until its separate privileged session path can be mediated safely; physical controller preset/trace operations are implemented.
@@ -158,7 +158,7 @@ Compare a direct timing sample with bridged timing to measure added overhead, no
 
 Start with the production Swift helper running independently and forwarding the supported test-controller requests to the simulated camera. Configure one fixed camera destination and a loopback development listener. Run the existing `verify` scenarios through the actual helper; require all six to pass with camera request evidence and correct errors. This first working bridge milestone has been achieved in both simulated ownership profiles. Continue with the remaining phase work and independent safety review before release.
 
-Then add the typed app interface, independent lifetime/registration, exclusive listener ownership, authenticated app access and initial optional diagnostics. Extend the bench for authentication, streaming and session/address adaptation as those paths are added; use captured or documented exchanges rather than guessed controller behavior. Use simulated peers to test our parsing/transport/logging, not camera feature semantics. The focused helper and logging checks now pass; target-Mac service behavior and equipment interoperability still require rehearsal.
+Then add the typed app interface, independent lifetime/registration, exclusive listener ownership, authenticated app access and initial optional diagnostics. Extend the bench for authentication, streaming and session/address adaptation as those paths are added; use captured or documented exchanges rather than guessed controller behavior. Use simulated peers to test our parsing/transport/logging, not camera feature semantics. The focused helper and logging checks now pass; the isolated host service now passes ten native registration/lifecycle checks; the booth Mac and equipment interoperability still require rehearsal.
 
 Keep the test rig standalone and reusable. The test-only reference relay is not the production bridge and its code is not the basis for shipping the Swift helper. On helper process restart, a private recovery marker requires explicit physical stops and fresh finite-operation completion before a new tracking start. Healthy app reconnects retain the existing helper and do not require that sequence.
 
@@ -182,7 +182,7 @@ Implement only proven native command/status/capability adaptation. Test the sing
 
 **Exit:** native actions invoke existing Churchfront actions through the new adapter when enabled, pass unchanged when disabled, and reflect actual app state. No double activation or preset interception is introduced.
 
-### Phase 6 Package and exercise new failures — bundle checked; service rehearsal pending
+### Phase 6 Package and exercise new failures — bundle and isolated host service checked
 
 Embed/sign helper/metadata before signing the whole app. Check helper presence, identity, registration, supported interface/startup and initial logging default/opt-out. Inject app loss, helper restart, route failure, reordered callbacks, malformed bridge input, mismatch and log/storage exhaustion. Test our isolation mechanisms, not causes of upstream crashes. Coordinate helper replacement and whole-build rollback.
 

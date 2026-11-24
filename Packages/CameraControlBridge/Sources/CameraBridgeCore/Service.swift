@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import CameraBridgeClient
 import CryptoKit
+import MachO
 
 public final class BridgeService {
     private var controller: HTTPListener?
@@ -31,8 +32,17 @@ public final class BridgeService {
         let marker = try JSONSerialization.data(withJSONObject: ["version": 1, "configuration_id": configuration.identity])
         try marker.write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recoveryURL.path)
-        let executable = URL(fileURLWithPath: CommandLine.arguments[0])
-        let identity = "protocol1:" + SHA256.hash(data: (try? Data(contentsOf: executable)) ?? Data()).prefix(12).map { String(format: "%02x", $0) }.joined()
+        // launchd may supply only a name in argv[0]. Resolve the loaded process
+        // image instead; hashing empty data would hide a broken build agreement.
+        var pathSize: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &pathSize)
+        guard pathSize > 0 else { throw BridgeFailure("Cannot locate the running helper executable", status: 500) }
+        var path = [CChar](repeating: 0, count: Int(pathSize))
+        guard _NSGetExecutablePath(&path, &pathSize) == 0 else {
+            throw BridgeFailure("Cannot locate the running helper executable", status: 500)
+        }
+        let executable = URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath()
+        let identity = "protocol1:" + SHA256.hash(data: try Data(contentsOf: executable)).prefix(12).map { String(format: "%02x", $0) }.joined()
         let logPath = configuration.diagnosticsFile ?? URL(fileURLWithPath: configuration.tokenFile).deletingLastPathComponent().appendingPathComponent("bridge-diagnostics.jsonl").path
         let diagnostics = Diagnostics(enabled: configuration.diagnosticsEnabled, path: logPath,
                                       helperBuild: identity, configurationID: configuration.identity)
