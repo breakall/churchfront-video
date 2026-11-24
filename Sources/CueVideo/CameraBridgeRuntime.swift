@@ -18,12 +18,22 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
     var onTrackingRevoked: ((UUID) -> Void)?
     private let lock = NSLock()
     private var connection: CameraBridgeConnection?
+    private var bridgeOwnsCanon = false
     private var managed: Set<UUID> = []
+    // A factory can see a new camera before the settings observer runs.
+    // Its commands must wait for a helper attached to that exact destination.
+    private var connectedCamera: PTZCamera?
     private var camera: PTZCamera?
     private var settings = CameraBridgeSettings()
     private var revision = UUID()
     private var lifecycle: Task<Void, Never>?
     private var configurationID: String?
+
+    private let helperDirectory: URL
+
+    init(helperDirectory: URL = CameraBridgeRuntime.directory) {
+        self.helperDirectory = helperDirectory
+    }
 
     static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -37,8 +47,23 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
     }
 
     func adapter(for camera: PTZCamera, queue: DispatchQueue) -> PTZLink? {
-        guard isManaged(camera.id) else { return nil }
-        return CanonBridgeLink(camera: camera, connection: { [weak self] in self?.currentConnection() }, queue: queue)
+        let needsBridge = lock.withLock {
+            guard bridgeOwnsCanon, camera.proto == .canonXC else { return false }
+            managed.insert(camera.id)
+            return true
+        }
+        guard needsBridge else { return nil }
+        return CanonBridgeLink(camera: camera, connection: { [weak self] in
+            self?.connection(for: camera)
+        }, queue: queue)
+    }
+
+    private func connection(for camera: PTZCamera) -> CameraBridgeConnection? {
+        lock.withLock {
+            guard connectedCamera?.id == camera.id, connectedCamera?.host == camera.host,
+                  connectedCamera?.port == camera.port else { return nil }
+            return connection
+        }
     }
 
     func configure(_ next: CameraBridgeSettings, cameras: [PTZCamera]) {
@@ -46,17 +71,27 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         let selected = try? next.camera(in: cameras)
         let sameRoute = camera?.id == selected?.id && camera?.host == selected?.host &&
             camera?.port == selected?.port && camera?.proto == selected?.proto
+        if next.enabled {
+            lock.withLock {
+                bridgeOwnsCanon = true
+                managed = Set(cameras.filter { $0.proto == .canonXC }.map(\.id))
+            }
+        }
         guard settings != next || !sameRoute else { camera = selected; return }
+        var withNewDiagnostics = settings
+        withNewDiagnostics.diagnosticsEnabled = next.diagnosticsEnabled
+        if sameRoute, withNewDiagnostics == next, next.enabled, let selected {
+            settings = next
+            do { try writeConfiguration(camera: selected) }
+            catch { message = "Could not apply bridge diagnostics: \(error.localizedDescription)" }
+            return
+        }
         let wasEnabled = settings.enabled
         revision = UUID()
         let expected = revision
         let outgoing = invalidateConnection()
         settings = next
         camera = selected
-        if next.enabled {
-            // Misconfiguration fails closed for Canon cameras instead of opening direct sessions.
-            lock.withLock { managed.formUnion(cameras.filter { $0.proto == .canonXC }.map(\.id)) }
-        }
         refreshRoutes()
         let previous = lifecycle
         previous?.cancel()
@@ -72,16 +107,16 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
                     guard await self.unregister(expected: expected) else { return }
                 }
                 guard self.revision == expected, !Task.isCancelled else { return }
-                self.lock.withLock { self.managed.removeAll() }
+                self.lock.withLock { self.bridgeOwnsCanon = false; self.managed.removeAll() }
                 self.message = "Bridge is off."
                 self.refreshRoutes()
                 return
             }
             do {
-                let selected = try next.camera(in: cameras)
-                if wasEnabled {
+                if wasEnabled || selected == nil {
                     guard await self.unregister(expected: expected) else { return }
                 }
+                let selected = try next.camera(in: cameras)
                 guard self.revision == expected, !Task.isCancelled else { return }
                 try self.writeConfiguration(camera: selected)
                 try self.register()
@@ -157,7 +192,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         panel.allowedContentTypes = [.json]
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         do {
-            let events = Self.diagnosticEvents(in: Self.directory)
+            let events = Self.diagnosticEvents(in: helperDirectory)
             var report: [String: Any] = ["schemaVersion": 1, "exportedAt": ISO8601DateFormatter().string(from: Date()),
                 "appVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development",
                 "appBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development",
@@ -192,7 +227,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
 
     func authorizeTracking(_ id: UUID, done: @escaping (String?) -> Void) {
         guard isManaged(id) else { done(nil); return }
-        guard let connection = currentConnection() else {
+        guard let camera, camera.id == id, let connection = connection(for: camera) else {
             message = "Tracking cannot start because the bridge is unavailable."
             done(message); return
         }
@@ -240,7 +275,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         var address = URLComponents()
         address.scheme = "http"; address.host = camera.host; address.port = Int(camera.port)
         guard let url = address.url else { throw CameraBridgeSetupError("The camera address is invalid.") }
-        let directory = Self.directory
+        let directory = helperDirectory
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
         let configuration = BridgeConfiguration(cameraURL: url.absoluteString, listenHost: settings.listenHost,
@@ -270,9 +305,9 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         for _ in 0..<40 {
             guard !Task.isCancelled, revision == expected else { return }
             do {
-                let ready = try JSONDecoder().decode(Ready.self, from: Data(contentsOf: Self.directory.appendingPathComponent("ready.json")))
+                let ready = try JSONDecoder().decode(Ready.self, from: Data(contentsOf: helperDirectory.appendingPathComponent("ready.json")))
                 guard ready.version == 1, let url = URL(string: ready.app_url),
-                      ready.token_file == Self.directory.appendingPathComponent("app-token").path,
+                      ready.token_file == helperDirectory.appendingPathComponent("app-token").path,
                       ready.configuration_id == configurationID else {
                     throw CameraBridgeSetupError("The helper and application connection metadata do not agree.")
                 }
@@ -307,10 +342,10 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
                         self.recover(expected: expected)
                     }
                 }
-                lock.withLock { connection = next }
+                lock.withLock { connection = next; connectedCamera = camera }
                 do { try await next.connect() }
                 catch {
-                    lock.withLock { if connection === next { connection = nil } }
+                    lock.withLock { if connection === next { connection = nil; connectedCamera = nil } }
                     await next.disconnect()
                     throw error
                 }
@@ -332,7 +367,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
     }
 
     private func invalidateConnection() -> CameraBridgeConnection? {
-        let old = lock.withLock { let old = connection; connection = nil; return old }
+        let old = lock.withLock { let old = connection; connection = nil; connectedCamera = nil; return old }
         old?.invalidate()
         status = nil
         running = false

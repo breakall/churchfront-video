@@ -85,3 +85,19 @@ The `camera-bridge-bench-1` prerelease packages a universal release build made w
 The exact signed universal helper passed all 57 process-level simulator checks on Apple silicon. Its SHA-256 is `3368e168ad32c0202bc8f2e4de37a585499a03f461079eb85f33de7da0d21eb3`. Evidence is in `.camera-rig/universal-release-helper-verification.json` and `.camera-rig/universal-release-bundle-verification.json`. The earlier actual-app UI rehearsal used the development build of the same app/bridge source; this packaging check does not repeat it. Intel execution, the equipment Mac's background-service approval and real camera/controller interoperability remain target-Mac checks.
 
 The download includes the helper in the app bundle; it needs no separate helper installer or development tools. The build uses ad hoc signatures and has no Apple notarization. The [equipment Mac guide](equipment-mac-setup.md) covers download, first launch, profile backup, network configuration, focused rehearsal and rollback.
+
+## Equipment test build 2
+
+The November 24 review identified nine operator-facing defects and three code-quality findings in equipment test build 1. The changes in `camera-bridge-bench-2` cover all twelve. Build 4 runs on macOS 14 or later and includes Intel and Apple silicon executables.
+
+| Review area | Regression evidence |
+| --- | --- |
+| Stop and physical priority | The camera simulator receives a stop when tracking stops or disconnects during the first pan. A lost pan acknowledgement triggers a stop without replay. A physical takeover during software cleanup or session acquisition prevents the obsolete move or claim. |
+| Camera recovery and focus | An explicit start after the simulated camera loses its sessions restores control and can move and stop the camera. An absolute focus command from the simulated controller disables tracking. |
+| App status | A delayed Start reply succeeds when the status poll already observed that same authorization. A failing heartbeat reports the current connection generation and polling can continue. |
+| Safe configuration changes | Incomplete camera entries receive managed adapters. Changing diagnostics while the joystick is held preserves the physical route and app connection, followed by a successful joystick release. |
+| Command queue and shared Canon handling | Interleaved joystick/zoom samples collapse while preset and ownership boundaries retain their order. Both transports use shared Canon conversions. Tests check stop values, speed limits, exposure and preset decoding. The helper uses typed command origins for ownership checks. |
+
+The signed universal helper passed 65 simulator scenarios. The macOS service bench passed all 10 scenarios and verified cleanup. The source suite passed 30 simulator-utility tests, 4 helper-package tests and 26 focused app and camera tests. The ZIP was extracted, its contents compared with the tested bundle and its signatures and architectures verified. The signed helper SHA-256 is `da2841e53a545fc8cc98c06f7c1fcd745c45651ba1e793c3404e3558b335601c`.
+
+The visible tracking badge was exercised in the earlier build-1 rehearsal. Build 2 verification exercised its updated connection and tracking callbacks plus the packaged helper on Apple silicon. Physical firmware behavior, operator-visible timing and install approval on the equipment Mac remain part of the [off-air rehearsal](equipment-mac-setup.md).

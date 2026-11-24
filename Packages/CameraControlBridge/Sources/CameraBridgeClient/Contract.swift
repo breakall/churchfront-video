@@ -94,7 +94,7 @@ public struct BridgeConfiguration: Codable, Sendable, Equatable {
     public var identity: String {
         let fields: [String: Any] = ["version": 1, "cameraURL": cameraURL, "listenHost": listenHost,
             "controllerPort": controllerPort, "appPort": appPort, "controllerAddress": controllerAddress,
-            "diagnosticsEnabled": diagnosticsEnabled, "requestTimeout": requestTimeout, "leaseTimeout": leaseTimeout]
+            "requestTimeout": requestTimeout, "leaseTimeout": leaseTimeout]
         let data = (try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])) ?? Data()
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }

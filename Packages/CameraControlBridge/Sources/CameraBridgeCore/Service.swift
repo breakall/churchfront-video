@@ -7,6 +7,7 @@ import MachO
 public final class BridgeService {
     private var controller: HTTPListener?
     private var app: HTTPListener?
+    private var diagnosticsRefresh: Task<Void, Never>?
     private var timer: Task<Void, Never>?
     private var lockDescriptor: Int32 = -1
     private let configuration: BridgeConfiguration
@@ -22,7 +23,7 @@ public final class BridgeService {
         }
         self.configuration = configuration
     }
-    public func start() async throws -> [String: String] {
+    public func start(configurationFile: URL? = nil) async throws -> [String: String] {
         let token = try loadToken()
         let lockPath = configuration.tokenFile + ".lock"
         lockDescriptor = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
@@ -61,13 +62,32 @@ public final class BridgeService {
                 if !Task.isCancelled { await bridge.expire() }
             }
         }
+        if let configurationFile {
+            // Config is atomically replaced by Setup. Refresh the one live preference off
+            // the forwarding and heartbeat paths, even after the UI quits.
+            let expectedIdentity = configuration.identity
+            diagnosticsRefresh = Task.detached(priority: .utility) {
+                var lastUpdate: Date?
+                while !Task.isCancelled {
+                    if let attributes = try? FileManager.default.attributesOfItem(atPath: configurationFile.path),
+                       let modified = attributes[.modificationDate] as? Date, modified != lastUpdate,
+                       let data = try? Data(contentsOf: configurationFile),
+                       let updated = try? JSONDecoder().decode(BridgeConfiguration.self, from: data),
+                       updated.identity == expectedIdentity {
+                        diagnostics.setEnabled(updated.diagnosticsEnabled)
+                        lastUpdate = modified
+                    }
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                }
+            }
+        }
         diagnostics.record("helper_started", generation: 0, origin: "helper")
         let host = configuration.listenHost.contains(":") ? "[\(configuration.listenHost)]" : configuration.listenHost
         return ["controller_url": "http://\(host):\(controllerPort)", "app_url": "http://127.0.0.1:\(appPort)", "token_file": configuration.tokenFile,
                 "configuration_id": configuration.identity, "helper_build": identity]
     }
     public func stop() {
-        timer?.cancel(); controller?.stop(); app?.stop()
+        diagnosticsRefresh?.cancel(); timer?.cancel(); controller?.stop(); app?.stop()
         if lockDescriptor >= 0 { Darwin.close(lockDescriptor); lockDescriptor = -1 }
     }
     deinit { stop() }

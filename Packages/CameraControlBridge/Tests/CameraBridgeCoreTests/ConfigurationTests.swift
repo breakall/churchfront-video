@@ -24,6 +24,6 @@ final class ConfigurationTests: XCTestCase {
         var newRoute = original; newRoute.cameraURL = "http://127.0.0.1:18083"
         XCTAssertNotEqual(original.identity, newRoute.identity)
         var optOut = original; optOut.diagnosticsEnabled = false
-        XCTAssertNotEqual(original.identity, optOut.identity)
+        XCTAssertEqual(original.identity, optOut.identity, "Live diagnostic changes preserve the route identity")
     }
 }

@@ -619,16 +619,6 @@ final class CanonLink: PTZLink {
 
     private var base: String { "http://\(camera.host)\(camera.port == 80 ? "" : ":\(camera.port)")/-wvhttp-01-/" }
 
-    /// Canon replies with "key:=value" lines ("key==value" while a value is changing).
-    static func parse(_ text: String) -> [String: String] {
-        var out: [String: String] = [:]
-        for line in text.split(whereSeparator: \.isNewline) {
-            let l = String(line)
-            if let r = l.range(of: ":=") ?? l.range(of: "==") { out[String(l[..<r.lowerBound])] = String(l[r.upperBound...]) }
-        }
-        return out
-    }
-
     private func get(_ path: String, _ done: ((String?) -> Void)? = nil) {
         guard let url = URL(string: base + path) else { done?(nil); return }
         let generation = connectionGeneration
@@ -676,7 +666,7 @@ final class CanonLink: PTZLink {
         get("open.cgi") { [weak self] text in
             guard let self else { return }
             self.opening = false
-            guard let text, let s = Self.parse(text)["s"] else {
+            guard let text, let s = CanonXC.parse(text)["s"] else {
                 self.online = false
                 self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in self?.open() }
                 return
@@ -701,7 +691,7 @@ final class CanonLink: PTZLink {
                 self.session = nil; self.hasControl = false; self.online = false; self.open(); return
             }
             self.online = true
-            self.hasControl = (Self.parse(text)["s.control"] ?? "").hasPrefix("enabled")
+            self.hasControl = (CanonXC.parse(text)["s.control"] ?? "").hasPrefix("enabled")
             if !self.hasControl && !self.claimRetry {
                 self.claimRetry = true
                 self.queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -725,42 +715,19 @@ final class CanonLink: PTZLink {
         lastPresetRead = Date()
         get("info.cgi") { [weak self] text in
             guard let self, let text else { return }
-            let kv = Self.parse(text)
+            let kv = CanonXC.parse(text)
             if let model = kv["s.hardware"] { self.onModel?(model) }
-            var names: [Int: String] = [:]
-            var exposureOnly: Set<Int> = []
-            for (k, v) in kv where k.hasPrefix("p.") && k.hasSuffix(".name.utf8") && !v.isEmpty {
-                guard let n = Int(k.dropFirst(2).dropLast(10)), kv["p.\(n).content"] != "disabled" else { continue }
-                names[n] = v
-                // Presets like "Exposure" hold the picture's exposure but no position.
-                if kv["p.\(n).content.ptz"] == "disabled" { exposureOnly.insert(n) }
-            }
-            self.onPresets?(names)
-            self.onExposurePresets?(exposureOnly)
-            self.onExposure?(Self.exposure(kv))
+            let presets = CanonXC.presets(kv)
+            self.onPresets?(presets.names)
+            self.onExposurePresets?(presets.exposureOnly)
+            self.onExposure?(CanonXC.exposure(kv))
         }
-    }
-
-    static func exposure(_ kv: [String: String]) -> CameraExposure {
-        func list(_ k: String) -> [Int] { (kv["c.1.\(k).list"] ?? "").split(separator: ",").compactMap { Int($0) } }
-        var e = CameraExposure()
-        e.value = PTZExposure(gain: kv["c.1.me.gain"].flatMap(Int.init), shutter: kv["c.1.me.shutter"].flatMap(Int.init),
-                              iris: kv["c.1.me.diaphragm"].flatMap(Int.init))
-        let auto = kv["c.1.exp"] == "auto"
-        e.gainAuto = auto || kv["c.1.me.gain.mode"] == "auto"
-        e.shutterAuto = auto || kv["c.1.me.shutter.mode"] == "auto"
-        e.irisAuto = auto || kv["c.1.me.diaphragm.mode"] == "auto"
-        e.gainList = list("me.gain"); e.shutterList = list("me.shutter"); e.irisList = list("me.diaphragm")
-        e.value.wb = kv["c.1.wb"]
-        e.value.kelvin = kv["c.1.wb.kelvin"].flatMap(Int.init)
-        e.kelvinList = list("wb.kelvin")
-        return e
     }
 
     func readExposure() {
         get("info.cgi") { [weak self] text in
             guard let self, let text else { return }
-            self.onExposure?(Self.exposure(Self.parse(text)))
+            self.onExposure?(CanonXC.exposure(CanonXC.parse(text)))
         }
     }
 
@@ -770,16 +737,9 @@ final class CanonLink: PTZLink {
     /// Exposure goes through the same control channel as pan and tilt, as on the camera's own
     /// web page. Each value set also switches that one setting (and the camera) to manual.
     func setExposure(_ e: PTZExposure) {
-        var q: [String] = e.hasExposure ? ["exp=manual"] : []
-        if let g = e.gain { q += ["me.gain.mode=manual", "me.gain=\(g)"] }
-        if let s = e.shutter { q += ["me.shutter.mode=speed", "me.shutter=\(s)"] }
-        if let i = e.iris { q += ["me.diaphragm.mode=manual", "me.diaphragm=\(i)"] }
-        // White balance: a kelvin value sets kelvin mode; a mode alone (auto, daylight,
-        // tungsten) sets just that.
-        if let k = e.kelvin, e.wb == nil || e.wb == "kelvin" { q += ["wb=kelvin", "wb.kelvin=\(k)"] }
-        else if let m = e.wb { q += ["wb=\(m)"] }
-        guard !q.isEmpty else { return }
-        control(q.joined(separator: "&"))
+        let parameters = CanonXC.exposureParameters(e)
+        guard !parameters.isEmpty else { return }
+        control(CanonXC.query(parameters))
         // Read back what the camera actually took, once the command has gone.
         queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.readExposure() }
     }
@@ -832,29 +792,23 @@ final class CanonLink: PTZLink {
         }
     }
 
-    // Canon speeds run 10 to 10000 for pan and tilt (very fast at the top), 0 to 127 for zoom.
-    private func speed(_ v: Double) -> Int { min(10000, Int(10 + v * v * 3000)) }
-
     func drive(pan: Double, tilt: Double) {
-        let p = pan == 0 ? "pan=stop" : "pan=\(pan < 0 ? "left" : "right")&pan.speed=\(speed(pan))"
-        let t = tilt == 0 ? "tilt=stop" : "tilt=\(tilt > 0 ? "up" : "down")&tilt.speed=\(speed(tilt))"
-        let q = p + "&" + t
-        lastDrive = q
-        control(q, key: "drive")
-        if pan == 0 && tilt == 0 { resendStop(q, key: "drive") { $0.lastDrive } }
+        sendDrive(CanonXC.movement(pan: pan, tilt: tilt))
     }
 
     func driveRaw(pan: Int, tilt: Int) {
-        let p = pan == 0 ? "pan=stop" : "pan=\(pan < 0 ? "left" : "right")&pan.speed=\(min(10000, max(20, abs(pan))))"
-        let t = tilt == 0 ? "tilt=stop" : "tilt=\(tilt > 0 ? "up" : "down")&tilt.speed=\(min(10000, max(20, abs(tilt))))"
-        let q = p + "&" + t
+        sendDrive(CanonXC.rawMovement(pan: pan, tilt: tilt))
+    }
+
+    private func sendDrive(_ parameters: [String: String]) {
+        let q = CanonXC.query(parameters)
         lastDrive = q
         control(q, key: "drive")
-        if pan == 0 && tilt == 0 { resendStop(q, key: "drive") { $0.lastDrive } }
+        if Self.isStop(q) { resendStop(q, key: "drive") { $0.lastDrive } }
     }
 
     func zoom(_ v: Double) {
-        let q = v == 0 ? "zoom=stop" : "zoom=\(v > 0 ? "tele" : "wide")&zoom.speed=\(min(127, Int(1 + abs(v) * 60)))"
+        let q = CanonXC.query(CanonXC.zoomParameters(v))
         lastZoom = q
         control(q, key: "zoom")
         if v == 0 { resendStop(q, key: "zoom") { $0.lastZoom } }
@@ -879,17 +833,9 @@ final class CanonLink: PTZLink {
         // Only pan, tilt and zoom: about 1 KB instead of the whole 30 KB info page.
         guard let url = URL(string: base + "info.cgi?item=c.1.pan,c.1.tilt,c.1.zoom") else { done(nil); return }
         reads.dataTask(with: url) { [weak self] data, _, _ in
-            let kv = data.map { Self.parse(String(decoding: $0, as: UTF8.self)) } ?? [:]
-            self?.queue.async { Self.position(kv, done) }
+            let kv = data.map { CanonXC.parse(String(decoding: $0, as: UTF8.self)) } ?? [:]
+            self?.queue.async { done(CanonXC.position(kv)) }
         }.resume()
-    }
-
-    private static func position(_ kv: [String: String], _ done: @escaping (PTZPosition?) -> Void) {
-        do {
-            guard let p = kv["c.1.pan"].flatMap(Int.init), let t = kv["c.1.tilt"].flatMap(Int.init),
-                  let z = kv["c.1.zoom"].flatMap(Int.init) else { done(nil); return }
-            done(PTZPosition(pan: p, tilt: t, zoom: z))
-        }
     }
 
     /// Deletes a preset the way the camera's own web page does: changing presets needs a
@@ -921,11 +867,11 @@ final class CanonLink: PTZLink {
         }
         call("open.cgi?s.priority=40") { code, _, body in
             if code == 401 { finish("The camera turned down the saved login. Check the user name and password in Setup.", nil); return }
-            guard let sid = Self.parse(body)["s"] else { finish("The camera wouldn't open a logged-in session (HTTP \(code)).", nil); return }
+            guard let sid = CanonXC.parse(body)["s"] else { finish("The camera wouldn't open a logged-in session (HTTP \(code)).", nil); return }
             var tries = 0
             func claim() {
                 call("claim.cgi?s=\(sid)") { _, _, body in
-                    let control = Self.parse(body)["s.control"] ?? ""
+                    let control = CanonXC.parse(body)["s.control"] ?? ""
                     if control.hasPrefix("enabled") {
                         call("preset/set?p=\(n)&cmd=delete&s=\(sid)") { _, status, body in
                             if status.hasPrefix("0") { finish(nil, sid) }

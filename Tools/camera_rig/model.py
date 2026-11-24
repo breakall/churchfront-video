@@ -34,6 +34,7 @@ class CameraModel:
         self.prepared = None
         self.focus_action = "stop"
         self.focus_mode = "auto"
+        self.focus_value = 0
 
     def step(self, seconds):
         if not math.isfinite(seconds) or not 0 <= seconds <= 3600:
@@ -73,7 +74,7 @@ class CameraModel:
     def info(self):
         result = {"s.hardware": "Canon CR-N500", "s.firmware": "SIMULATOR",
                   "s.system.status": "idle", "c.1.focus": self.focus_mode,
-                  "c.1.focus.action": self.focus_action,
+                  "c.1.focus.action": self.focus_action, "c.1.focus.value": str(self.focus_value),
                   "t.status": "recording" if self.recording else "playing" if self.playing else "prepared" if self.prepared else "idle"}
         for axis in self.pose:
             result[f"c.1.{axis}"] = str(round(self.pose[axis]))
@@ -108,6 +109,9 @@ class CameraModel:
                 raise ProtocolError(408, "simulated trace event limit reached")
             self.recording["events"].append((self.elapsed - self.recording["started"], parameters.copy()))
         for key, value in parameters.items():
+            if key == "focus.value":
+                self.focus_value = int(value)
+                continue
             if key == "focus.action":
                 if value not in ("near", "far", "stop", "one_shot"):
                     raise ProtocolError(403, "invalid focus action")
@@ -146,6 +150,9 @@ class CameraModel:
             if key == "p":
                 if self.number(value, 100) not in self.presets:
                     raise ProtocolError(403, "preset has not been stored")
+            elif key == "focus.value":
+                if not value.isdecimal() or not 0 <= int(value) <= 2048:
+                    raise ProtocolError(403, "invalid focus position")
             elif key == "focus.action":
                 if value not in ("near", "far", "stop", "one_shot"):
                     raise ProtocolError(403, "invalid focus action")

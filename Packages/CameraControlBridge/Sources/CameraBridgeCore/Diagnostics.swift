@@ -6,19 +6,21 @@ final class Diagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private var pending = 0
     private var drops = 0
-    let enabled: Bool
+    private var captureEnabled: Bool
+    var enabled: Bool { lock.withLock { captureEnabled } }
+    func setEnabled(_ enabled: Bool) { lock.withLock { captureEnabled = enabled } }
     private let path: String?
     private let helperBuild: String
     private let configurationID: String
     init(enabled: Bool, path: String?, helperBuild: String, configurationID: String) {
-        self.enabled = enabled; self.path = path; self.helperBuild = helperBuild; self.configurationID = configurationID
+        self.captureEnabled = enabled; self.path = path; self.helperBuild = helperBuild; self.configurationID = configurationID
     }
     var dropped: Int { lock.lock(); defer { lock.unlock() }; return drops }
     func record(_ decision: String, generation: UInt64, origin: String, endpoint: String = "", status: Int? = nil,
                 requestID: String? = nil, parameters: [String: String] = [:], livescope: String? = nil,
                 queueDepth: Int? = nil, queueWaitMs: Double? = nil, durationMs: Double? = nil) {
-        guard enabled else { return }
         lock.lock()
+        guard captureEnabled else { lock.unlock(); return }
         guard pending < 256 else { drops += 1; lock.unlock(); return }
         pending += 1; lock.unlock()
         let event = Event(time: Date().timeIntervalSince1970, monotonic: ProcessInfo.processInfo.systemUptime,

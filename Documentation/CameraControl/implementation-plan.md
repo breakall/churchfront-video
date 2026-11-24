@@ -32,7 +32,7 @@ Actual unavailable-message/Start bridge UI rehearsal passed on this Mac with a s
 
 Actual tracking takeover and indicator rehearsal also passed with loopback camera/controller/ATEM simulators. A physical joystick command stopped an existing `following` session in the real app, changed TRACKING to TRACK, removed FOLLOWING and displayed the manual-control message. The same app connection remained attached, physical forwarding succeeded, and tracking stayed off after explicit release. Temporary service, app, profile and log changes were cleaned up.
 
-The `camera-bridge-bench-1` equipment prerelease supplies a universal macOS 14+ app download and [installation/rehearsal guide](equipment-mac-setup.md) for the separate equipment Mac. Both architectures and archive integrity are checked; the exact release helper passes all 57 simulator checks on Apple silicon. Target-Mac installation/approval and real equipment compatibility remain pending.
+The `camera-bridge-bench-2` equipment prerelease supplies a universal macOS 14+ app download and [installation/rehearsal guide](equipment-mac-setup.md) for the separate equipment Mac. Both architectures and archive integrity are checked; the exact release helper passes all 65 simulator checks on Apple silicon. Target-Mac installation/approval and real equipment compatibility remain pending.
 
 Detailed evidence, exact helper build identity, reproduction commands and remaining target-Mac checks are in the [verification record](verification.md). Camera-preset deletion from the app is unavailable in bridge mode until its separate privileged session path can be mediated safely; physical controller preset/trace operations are implemented.
 

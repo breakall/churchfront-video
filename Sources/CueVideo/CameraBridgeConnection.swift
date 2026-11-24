@@ -7,6 +7,27 @@ final class CameraBridgeConnection: @unchecked Sendable {
         let command: BridgeCommand
         let lease: BridgeLease
         let done: ((BridgeCameraReply?) -> Void)?
+        // A position, preset or mixed control is an ordering barrier. Only replace
+        // continuous direction samples for exactly the same set of axes.
+        let continuousAxes: Set<String>?
+    }
+
+    private static func continuousAxes(of command: BridgeCommand) -> Set<String>? {
+        guard command.method == "GET", command.endpoint == "control.cgi" else { return nil }
+        let parameters = command.parameters
+        var axes = Set<String>()
+        for (key, value) in parameters {
+            switch key {
+            case "pan" where ["left", "right", "stop"].contains(value),
+                 "tilt" where ["up", "down", "stop"].contains(value),
+                 "zoom" where ["tele", "wide", "stop"].contains(value):
+                axes.insert(key)
+            case "pan.speed", "tilt.speed", "zoom.speed":
+                guard parameters[String(key.dropLast(6))] != nil else { return nil }
+            default: return nil
+            }
+        }
+        return axes.isEmpty ? nil : axes
     }
     private let client: BridgeClient
     private let expectedConfiguration: String?
@@ -37,7 +58,7 @@ final class CameraBridgeConnection: @unchecked Sendable {
     @discardableResult
     private func replace(_ next: BridgeLease, expected: BridgeLease) -> Bool {
         lock.withLock {
-            guard active, currentLease == expected, next.connection == expected.connection,
+            guard active, currentLease == expected || currentLease == next, next.connection == expected.connection,
                   next.generation >= expected.generation else { return false }
             currentLease = next
             return true
@@ -83,22 +104,27 @@ final class CameraBridgeConnection: @unchecked Sendable {
         lock.withLock { if active { currentLease = lease } }
         let status = try await client.status()
         guard observe(status, expected: lease) else { throw CameraBridgeSetupError("The bridge connection changed while connecting.") }
-        pollTask = Task { [weak self] in
+        let poll = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, let expected = self.snapshot() else { return }
+                var requestLease = expected
                 do {
                     let status = try await self.client.status()
                     if self.observe(status, expected: expected), let lease = self.snapshot() {
+                        requestLease = lease
                         _ = self.observe(try await self.client.heartbeat(lease), expected: lease)
                     }
                 } catch {
                     if (error as? BridgeFailure)?.status != 409 {
-                        self.fail(error.localizedDescription, expected: expected)
-                        return
+                        // A newer lease can overtake a failed poll. Keep polling it.
+                        self.fail(error.localizedDescription, expected: requestLease)
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(100))
             }
+        }
+        lock.withLock {
+            if active { pollTask = poll } else { poll.cancel() }
         }
     }
 
@@ -138,14 +164,35 @@ final class CameraBridgeConnection: @unchecked Sendable {
               method: String = "GET", done: ((BridgeCameraReply?) -> Void)? = nil) {
         var startSender = false
         var overflowLease: BridgeLease?
+        var superseded: Pending?
         let enqueued = lock.withLock {
             guard active, let lease = currentLease else { return false }
-            guard pending.count < 64 else { overflowLease = lease; return false }
             let command = BridgeCommand(lease: lease, purpose: purpose, parameters: parameters, endpoint: endpoint, method: method)
-            pending.append(Pending(command: command, lease: lease, done: done))
+            let axes = Self.continuousAxes(of: command)
+            if let axes {
+                for index in pending.indices.reversed() {
+                    let older = pending[index]
+                    guard older.lease == lease, let oldAxes = older.continuousAxes else { break }
+                    // Interleaved manual zoom and joystick commands use different purposes.
+                    // Independent manual axes can coalesce across one another; a switch
+                    // between automatic and manual operation must retain its order.
+                    let samePurpose = older.command.purpose == purpose
+                    let manualPurposes = ["manual", "manualMove"]
+                    guard samePurpose || (manualPurposes.contains(purpose) &&
+                                          manualPurposes.contains(older.command.purpose)) else { break }
+                    if oldAxes == axes && samePurpose {
+                        superseded = pending.remove(at: index)
+                        break
+                    }
+                    if !oldAxes.isDisjoint(with: axes) { break }
+                }
+            }
+            guard pending.count < 64 else { overflowLease = lease; return false }
+            pending.append(Pending(command: command, lease: lease, done: done, continuousAxes: axes))
             if !sending { sending = true; startSender = true }
             return true
         }
+        superseded?.done?(nil)
         guard enqueued else {
             done?(nil)
             if let lease = overflowLease {
@@ -187,9 +234,10 @@ final class CameraBridgeConnection: @unchecked Sendable {
             if active { endedLease = currentLease }
             let abandoned = pending
             active = false; authorized = false; currentLease = nil; pending.removeAll()
+            pollTask?.cancel()
+            pollTask = nil
             return abandoned
         }
-        pollTask?.cancel()
         abandoned.forEach { $0.done?(nil) }
     }
 

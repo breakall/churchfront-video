@@ -7,9 +7,16 @@ import CameraBridgeClient
 struct Main {
     static func main() async {
         do {
-            let configuration = try parse(Array(CommandLine.arguments.dropFirst()))
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            let configFile = configurationURL(arguments)
+            let configuration: BridgeConfiguration
+            if let configFile {
+                configuration = try JSONDecoder().decode(BridgeConfiguration.self, from: Data(contentsOf: configFile))
+            } else {
+                configuration = try parse(arguments)
+            }
             let service = try BridgeService(configuration: configuration)
-            let urls = try await service.start()
+            let urls = try await service.start(configurationFile: configFile)
             var ready: [String: Any] = urls
             ready["version"] = 1; ready["pid"] = ProcessInfo.processInfo.processIdentifier
             let data = try JSONSerialization.data(withJSONObject: ready, options: [.sortedKeys])
@@ -35,14 +42,17 @@ struct Main {
             exit(1)
         }
     }
-    static func parse(_ arguments: [String]) throws -> BridgeConfiguration {
+    static func configurationURL(_ arguments: [String]) -> URL? {
         if arguments == ["--config-user"] {
             let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            return try JSONDecoder().decode(BridgeConfiguration.self, from: Data(contentsOf: base.appendingPathComponent("CueVideo/CameraBridge/helper.json")))
+            return base.appendingPathComponent("CueVideo/CameraBridge/helper.json")
         }
         if arguments.count == 2, arguments[0] == "--config" {
-            return try JSONDecoder().decode(BridgeConfiguration.self, from: Data(contentsOf: URL(fileURLWithPath: arguments[1])))
+            return URL(fileURLWithPath: arguments[1])
         }
+        return nil
+    }
+    static func parse(_ arguments: [String]) throws -> BridgeConfiguration {
         var options = [String: String](), enabled = true, index = 0
         let accepted = Set(["--camera-url", "--listen-host", "--controller-port", "--app-port", "--controller-address", "--token-file", "--ready-file", "--diagnostics-file", "--request-timeout", "--lease-timeout"])
         while index < arguments.count {

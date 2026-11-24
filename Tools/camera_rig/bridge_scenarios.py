@@ -24,7 +24,7 @@ from .scenarios import equal, verify
 class BridgeProcess:
     """Own just the helper process started for one isolated verification run."""
 
-    def __init__(self, binary, camera_url, directory, *, diagnostics=True, extra_args=(), diagnostics_directory=False):
+    def __init__(self, binary, camera_url, directory, *, diagnostics=True, extra_args=(), diagnostics_directory=False, config_file=False):
         self.binary = Path(binary).resolve()
         if not self.binary.is_file():
             raise ValueError("bridge executable does not exist; build it before running bridge-test")
@@ -39,6 +39,7 @@ class BridgeProcess:
         self.diagnostics = diagnostics
         self.process = None
         self.extra_args = list(extra_args)
+        self.config_file = self.directory / "helper.json" if config_file else None
 
     def __enter__(self):
         if self.token_file.exists():
@@ -54,6 +55,15 @@ class BridgeProcess:
         if not self.diagnostics:
             command.append("--no-diagnostics")
         command += self.extra_args
+        if self.config_file:
+            if self.extra_args:
+                raise ValueError("config file test fixtures use a complete config, without CLI overrides")
+            config = {"cameraURL": self.camera_url, "listenHost": "127.0.0.1", "controllerPort": 0,
+                      "appPort": 0, "controllerAddress": "127.0.0.1", "tokenFile": str(self.token_file),
+                      "readyFile": str(self.ready_file), "diagnosticsFile": str(self.diagnostics_destination),
+                      "diagnosticsEnabled": self.diagnostics, "requestTimeout": 2, "leaseTimeout": 3}
+            self.config_file.write_text(json.dumps(config))
+            command = [str(self.binary), "--config", str(self.config_file)]
         self.stdout = (self.directory / "helper.stdout").open("w+")
         self.stderr = (self.directory / "helper.stderr").open("w+")
         try:
@@ -320,6 +330,82 @@ def authentication(app, hardware, admin, bridge):
     command_ok(app.command(lease, {"pan": "right", "pan.speed": "100"}))
 
 
+def revoke_during_first_move(action):
+    def scenario(app, hardware, admin, bridge):
+        lease = app.start(app.connect())
+        admin.admin("fault", {"mode": "delay_after", "seconds": 0.4, "endpoint": "control.cgi"})
+        results = []
+        thread = threading.Thread(target=lambda: results.append(app.command(lease, {"pan": "left"})))
+        thread.start()
+        try:
+            wait_camera_event(admin, lambda e: e["parameters"].get("pan") == "left")
+            equal(app.request(action, lease).status, 200, "stop/disconnect waits for the moving axis")
+        finally:
+            thread.join(timeout=3)
+        equal(len(results), 1, "initial command completed")
+        equal(admin.admin("state")["commanded_axes"], [], "revoked first app pan must stop")
+    return scenario
+
+
+def ambiguous_app_motion(app, hardware, admin, bridge):
+    lease = app.start(app.connect())
+    admin.admin("fault", {"mode": "delay_after", "seconds": 0.5, "endpoint": "control.cgi"})
+    if app.command(lease, {"pan": "left"}).status < 400:
+        raise AssertionError("Ambiguous camera acknowledgement must report failure")
+    equal(admin.admin("state")["commanded_axes"], [], "stop possible app-owned motion even without RC input")
+    equal(len([e for e in camera_writes(admin) if e["parameters"].get("pan") == "left"]), 1, "movement never replays")
+    hardware.focus("one_shot").require_ok()
+    equal(app.status()["authorized"], False, "focus takeover stays disarmed")
+
+
+def camera_restart_session_recovery(app, hardware, admin, bridge):
+    old = app.start(app.connect())
+    command_ok(app.command(old, {"pan": "left"}))
+    app.request("stop", old).json()
+    admin.admin("reset", {})
+    fresh = app.start(app.current(old))
+    command_ok(app.command(fresh, {"pan": "right"}))
+    app.request("stop", fresh).json()
+    equal(admin.admin("state")["commanded_axes"], [], "recovered camera accepted move and stop")
+
+
+def takeover_during_session_open(app, hardware, admin, bridge):
+    lease = app.connect()
+    admin.admin("fault", {"mode": "delay_after", "seconds": 0.4, "endpoint": "open.cgi"})
+    result = []
+    worker = threading.Thread(target=lambda: result.append(app.request("start", lease)))
+    worker.start()
+    try:
+        wait_camera_event(admin, lambda event: event["endpoint"] == "open.cgi")
+        hardware.focus("far").require_ok()
+    finally:
+        worker.join(timeout=3)
+    equal(len(result), 1, "start completed after the delayed session open")
+    rejection(result[0])
+    events = admin.admin("events")["events"]
+    equal(any(event["endpoint"] == "claim.cgi" for event in events), False, "superseded app start never claims control")
+    equal(any(event["endpoint"] == "close.cgi" for event in events), True, "abandoned app session closed")
+    equal(app.status()["authorized"], False, "app stays disarmed")
+
+
+def takeover_during_manual_cleanup(app, hardware, admin, bridge):
+    lease = app.start(app.connect())
+    command_ok(app.command(lease, {"pan": "left"}))
+    admin.admin("fault", {"mode": "delay_after", "seconds": 0.4, "endpoint": "control.cgi"})
+    result = []
+    worker = threading.Thread(target=lambda: result.append(app.command(lease, {"pan": "1234"}, purpose="manualMove")))
+    worker.start()
+    try:
+        wait_camera_event(admin, lambda e: e["parameters"].get("pan") == "stop")
+        hardware.focus("far").require_ok()
+    finally:
+        worker.join(timeout=3)
+    equal(len(result), 1, "manual move caller completed")
+    rejection(result[0])
+    equal(any(e["parameters"].get("pan") == "1234" for e in camera_writes(admin)), False,
+          "physical takeover during cleanup discards the earlier software position move")
+
+
 def camera_failure(app, hardware, admin, bridge):
     lease = app.start(app.connect())
     admin.admin("fault", {"mode": "disconnect", "endpoint": "control.cgi"})
@@ -367,6 +453,32 @@ def diagnostics(app, hardware, admin, bridge):
     for line in content.splitlines():
         json.loads(line)
     equal(app.status()["diagnosticsEnabled"], True, "initial diagnostics enabled")
+
+
+def diagnostics_toggle_during_hardware_hold(app, hardware, admin, bridge):
+    lease = app.start(app.connect())
+    hardware.move("right", speed=100).require_ok()
+    baseline = app.status()
+    config = json.loads(bridge.config_file.read_text())
+    for enabled in (False, True):
+        config["diagnosticsEnabled"] = enabled
+        staged = bridge.config_file.with_suffix(".new")
+        staged.write_text(json.dumps(config))
+        staged.replace(bridge.config_file)
+        deadline = time.monotonic() + 2
+        while True:
+            status = app.status()
+            if status["diagnosticsEnabled"] == enabled or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        equal(status["diagnosticsEnabled"], enabled, "helper applied new diagnostic preference")
+        equal(status["connection"], lease["connection"], "same real app lease")
+        equal(status["generation"], baseline["generation"], "same manual takeover generation")
+        equal(status["heldAxes"], ["pan"], "physical pan remains held")
+        equal(admin.admin("state")["commanded_axes"], ["pan"], "real helper leaves camera panning")
+    hardware.move().require_ok()
+    equal(admin.admin("state")["commanded_axes"], [], "release crossed the unchanged route")
+    equal(app.status()["authorized"], False, "release after preference change keeps tracking off")
 
 
 def diagnostics_disabled(app, hardware, admin, bridge):
@@ -764,6 +876,13 @@ OWNERSHIP_SCENARIOS = (
     ("trace_play_stop_takeover", physical_trigger(playing_trace, lambda h: h.trace_play("stop"), False), {}),
     ("authenticated_versioned_app_interface", authentication, {}),
     ("app_disconnect_keeps_physical_forwarding", app_disconnect, {}),
+    ("stop_during_first_tracking_move", revoke_during_first_move("stop"), {}),
+    ("disconnect_during_first_tracking_move", revoke_during_first_move("disconnect"), {}),
+    ("uncertain_app_motion_stops_without_replay", ambiguous_app_motion, {"extra_args": ("--request-timeout", "0.15")}),
+    ("expired_camera_session_recovered_on_explicit_start", camera_restart_session_recovery, {"camera_ownership": "exclusive"}),
+    ("physical_takeover_during_camera_session_open", takeover_during_session_open, {}),
+    ("physical_takeover_during_manual_move_cleanup", takeover_during_manual_cleanup, {}),
+    ("absolute_focus_takeover", physical_trigger(no_setup, lambda h: h.command("control.cgi", {"c.1.focus.value": "500"})), {}),
     ("camera_failure_disarms_without_replay", camera_failure, {}),
     ("malformed_camera_response_disarms_and_recovers", malformed_camera_response, {}),
     ("bounded_in_flight_write_and_manual_takeover", in_flight_takeover, {}),
@@ -787,6 +906,7 @@ OWNERSHIP_SCENARIOS = (
     ("app_heartbeat_loss_keeps_physical_forwarding", lease_expiry, {"extra_args": ("--lease-timeout", "1")}),
     ("initial_diagnostics_and_secret_redaction", diagnostics, {}),
     ("diagnostics_opt_out", diagnostics_disabled, {"diagnostics": False}),
+    ("live_diagnostics_preserves_physical_hold_and_release", diagnostics_toggle_during_hardware_hold, {"config_file": True}),
     ("failed_diagnostics_storage_preserves_physical_control", failed_diagnostics_storage, {"diagnostics_directory": True}),
 )
 

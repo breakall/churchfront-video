@@ -5,7 +5,7 @@ import CueATEM
 @testable import CueVideo
 
 /// Scripted HTTP replies test the real app client without reproducing helper arbitration.
-private final class BridgeReplyFixture {
+final class BridgeReplyFixture {
     let listener: NWListener
     let queue = DispatchQueue(label: "camera-bridge.reply-fixture")
     let handle: (String, [String: Any]) -> ([String: Any], Double)
@@ -277,7 +277,7 @@ final class CameraBridgeAdapterTests: XCTestCase {
         try await connection.connect()
         connection.send(["pan": "right"], purpose: "manual")
         await fulfillment(of: [first], timeout: 3)
-        for _ in 0..<65 { connection.send(["pan": "stop"], purpose: "manual") }
+        for number in 0..<65 { connection.send(["p": String(number + 1)], purpose: "manualMove") }
         XCTAssertNil(connection.commandFence)
         await fulfillment(of: [disconnected], timeout: 3)
     }
