@@ -17,7 +17,7 @@ final class Upstream: @unchecked Sendable {
         return wire
     }
 
-    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+    func send(_ request: HTTPRequest, preserveWire: Bool = false) async throws -> HTTPResponse {
         let tls = url.scheme == "https"
         let host = url.host!
         let port = url.port ?? (tls ? 443 : 80)
@@ -39,7 +39,15 @@ final class Upstream: @unchecked Sendable {
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, done, error in
                     var buffer = buffer; if let data { buffer.append(data) }
                     do {
-                        if let reply = try Self.parse(buffer, complete: done) { finish(.success(reply)); return }
+                        if var reply = try Self.parse(buffer, complete: done) {
+                            // Preserve validated fixed-length session replies used by Canon firmware.
+                            // Other framing continues through the existing serializer.
+                            if preserveWire, reply.headers["content-length"] != nil {
+                                reply.originalWire = buffer
+                            }
+                            finish(.success(reply))
+                            return
+                        }
                         if let error { finish(.failure(error)); return }
                         if done { finish(.failure(HTTPError(502, "Incomplete camera response"))); return }
                         receive(buffer)

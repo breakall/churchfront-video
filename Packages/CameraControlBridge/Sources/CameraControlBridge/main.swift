@@ -36,7 +36,7 @@ struct Main {
                 continuation.onTermination = { _ in terminate.cancel(); interrupt.cancel() }
             }
             for await _ in stream { break }
-            service.stop()
+            await service.shutdown()
         } catch {
             FileHandle.standardError.write(Data("camera-control-bridge: \(error.localizedDescription)\n".utf8))
             exit(1)

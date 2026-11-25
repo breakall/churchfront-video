@@ -113,7 +113,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
                 return
             }
             do {
-                if wasEnabled || selected == nil {
+                if try wasEnabled || selected == nil || self.registeredHelperNeedsUpdate() {
                     guard await self.unregister(expected: expected) else { return }
                 }
                 let selected = try next.camera(in: cameras)
@@ -299,6 +299,19 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         var helper_build: String
     }
 
+    private func bundledHelperBuild() throws -> String {
+        let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/camera-control-bridge")
+        return "protocol1:" + SHA256.hash(data: try Data(contentsOf: executable)).prefix(12)
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func registeredHelperNeedsUpdate() throws -> Bool {
+        guard SMAppService.agent(plistName: Self.serviceName).status == .enabled,
+              let data = try? Data(contentsOf: helperDirectory.appendingPathComponent("ready.json")),
+              let ready = try? JSONDecoder().decode(Ready.self, from: data) else { return false }
+        return try ready.helper_build != bundledHelperBuild()
+    }
+
     private func attach(expected: UUID) async throws {
         message = "Connecting to the bridge…"
         var lastError: Error = CameraBridgeSetupError("The helper has not started. Check background-item approval in System Settings.")
@@ -312,9 +325,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
                     throw CameraBridgeSetupError("The helper and application connection metadata do not agree.")
                 }
                 let token = try String(contentsOfFile: ready.token_file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-                let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/camera-control-bridge")
-                let build = "protocol1:" + SHA256.hash(data: try Data(contentsOf: executable)).prefix(12)
-                    .map { String(format: "%02x", $0) }.joined()
+                let build = try bundledHelperBuild()
                 guard ready.helper_build == build else {
                     throw CameraBridgeSetupError("Restart the bridge to use the helper included in this application build.")
                 }

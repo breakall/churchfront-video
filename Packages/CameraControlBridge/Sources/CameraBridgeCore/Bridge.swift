@@ -18,19 +18,27 @@ actor Bridge {
     private var pendingPhysicalActions = 0
     private var activeStreams = 0
     private var recovering: Bool
+    private var awaitingStartupFocusMode: Bool
     private var recoveryAxes = Set<String>()
     private var lastHeartbeat = ProcessInfo.processInfo.systemUptime
-    private var cameraSession: String?
+    private let sessionOwner: CameraSessionOwner
+    private var sessions: ControllerSessions
+    private var currentLease: CameraSessionLease?
+    private var routeEpoch: UInt64 = 0
+    private var routeLost = false
+    private var lastMaintenance = -Double.infinity
+    private var releasedAxes = Set<String>()
+    private var stopping = false
     private var appAxes = Set<String>()
     private var jobs = [Job]()
     private var draining = false
     private enum JobOrigin: String {
-        case controller, tracking, manual, manualMove, stop, session, read
+        case controller, tracking, manual, manualMove, stop, session, verify, read
 
         var movesAppAxes: Bool {
             switch self {
             case .tracking, .manual, .manualMove: return true
-            case .controller, .stop, .session, .read: return false
+            case .controller, .stop, .session, .verify, .read: return false
             }
         }
     }
@@ -39,6 +47,7 @@ actor Bridge {
         var request: HTTPRequest
         var origin: JobOrigin
         var generation: UInt64
+        var routeEpoch: UInt64
         var connection: String?
         var requestID: String
         var enqueued: Double
@@ -48,8 +57,11 @@ actor Bridge {
 
     init(configuration: BridgeConfiguration, token: String, diagnostics: Diagnostics, helperBuild: String, recovering: Bool) {
         upstream = Upstream(url: URL(string: configuration.cameraURL)!, timeout: configuration.requestTimeout)
+        sessionOwner = CameraSessionOwner(upstream: upstream)
+        sessions = ControllerSessions(host: configuration.listenHost, port: configuration.controllerPort)
         self.token = token; self.diagnostics = diagnostics; leaseTimeout = configuration.leaseTimeout
         configurationID = configuration.identity; self.helperBuild = helperBuild
+        awaitingStartupFocusMode = recovering
         self.recovering = recovering
         if recovering {
             recoveryAxes = ["pan", "tilt", "zoom", "focus"]
@@ -57,6 +69,24 @@ actor Bridge {
             manualTakeover = true
         }
     }
+    func bindController(port: UInt16) { sessions.port = port }
+
+    func maintain() async {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !stopping, now - lastMaintenance >= 1 else { return }
+        lastMaintenance = now
+        _ = try? await enqueue(makeRequest("claim.cgi", parameters: [:]), origin: .session)
+    }
+
+    func shutdown() async {
+        stopping = true
+        routeEpoch &+= 1
+        revoke("helper_stopping")
+        // Wait for an admitted camera write before closing its session.
+        while draining { try? await Task.sleep(for: .milliseconds(10)) }
+        await sessionOwner.shutdown()
+    }
+
     func status() -> BridgeStatus {
         BridgeStatus(generation: generation, authorized: authorized, heldAxes: held.sorted(), health: health,
                      manualTakeover: manualTakeover, diagnosticsEnabled: diagnostics.enabled,
@@ -76,21 +106,30 @@ actor Bridge {
     func physical(_ request: HTTPRequest) async -> HTTPResponse {
         guard request.path.hasPrefix("/-wvhttp-01-/"), !request.target.contains("#") else { return HTTPResponse(status: 404) }
         do {
+            if let reply = try sessions.localReply(for: request) {
+                diagnostics.record("controller_session_reply", generation: generation, origin: "controller", endpoint: request.path,
+                                   status: reply.status, livescope: reply.headers["livescope-status"])
+                return reply
+            }
+            let view = try sessions.view(for: request)
             let parameters = try request.parameters
             let action = isPhysicalAction(request.path, parameters)
             if action {
                 revoke("manual_takeover", manual: true)
                 pendingPhysicalActions += 1
+                rememberAxisIntent(parameters)
                 updateHeld(request, releasing: false)
             }
             defer { if action { pendingPhysicalActions -= 1 } }
             if request.path.hasSuffix("info.cgi") {
-                let reply = try await upstream.send(request)
-                observe(reply, request: request)
-                rememberPhysicalSession(reply, request: request)
-                return reply
+                let snapshot = try request.withCameraSession(nil)
+                let reply = try await upstream.send(snapshot)
+                observe(reply, request: snapshot)
+                return view.reply(reply)
             }
-            return try await enqueue(request, origin: .controller)
+            if routeLost { return view.reply(HTTPResponse(status: 200, headers: ["livescope-status": "408 Conflict"])) }
+            let reply = try await enqueue(request, origin: .controller)
+            return view.reply(reply)
         } catch {
             if !(error is BridgeFailure), (error as? HTTPError)?.status ?? 502 >= 500 {
                 health = "unavailable"; revoke("camera_route_failed")
@@ -99,21 +138,37 @@ actor Bridge {
         }
     }
     func streamInformation(_ request: HTTPRequest, client: NWConnection) async {
-        guard activeStreams < 16, (try? request.parameters) != nil else {
-            let response = HTTPResponse(status: activeStreams >= 16 ? 503 : 400)
-            await withCheckedContinuation { continuation in
-                client.send(content: response.wire(), completion: .contentProcessed { _ in continuation.resume() })
+        let view: ControllerSessionView
+        let snapshot: HTTPRequest
+        do {
+            guard activeStreams < 16 else { throw HTTPError(503, "Stream limit") }
+            if let reply = try sessions.localReply(for: request) {
+                await sendInformation(reply, to: client)
+                return
             }
+            view = try sessions.view(for: request)
+            snapshot = try request.withCameraSession(nil)
+        } catch {
+            let status = (error as? HTTPError)?.status ?? 400
+            diagnostics.record("information_stream_rejected", generation: generation, origin: "controller", endpoint: request.path,
+                               reason: status == 503 ? "stream_limit" : "invalid_form", details: DiagnosticDetails.request(request))
+            await sendInformation(HTTPResponse(status: status), to: client)
             return
         }
         activeStreams += 1
+        sessions.trackStream(client, for: view.sessionID)
         let epoch = generation
         let requestID = UUID().uuidString, began = ProcessInfo.processInfo.systemUptime
+        let streamDiagnostics = diagnostics
         diagnostics.record("information_stream_opened", generation: generation, origin: "controller", endpoint: request.path, requestID: requestID)
-        defer { activeStreams -= 1 }
+        defer { activeStreams -= 1; sessions.untrackStream(client) }
         do {
-            try await upstream.stream(request, to: client) { [weak self] reply in
-                await self?.observeStream(reply, request: request, generation: epoch)
+            try await upstream.stream(snapshot, to: client, view: view, diagnostic: { event, status, livescope, details, reason in
+                streamDiagnostics.record(event, generation: epoch, origin: "controller", endpoint: request.path, status: status,
+                                   requestID: requestID, livescope: livescope,
+                                   durationMs: (ProcessInfo.processInfo.systemUptime - began) * 1000, reason: reason, details: details)
+            }) { [weak self] reply in
+                await self?.observeStream(reply, request: snapshot, generation: epoch)
             }
             diagnostics.record("information_stream_closed", generation: generation, origin: "controller", endpoint: request.path,
                                requestID: requestID, durationMs: (ProcessInfo.processInfo.systemUptime - began) * 1000)
@@ -123,9 +178,15 @@ actor Bridge {
                                requestID: requestID, durationMs: (ProcessInfo.processInfo.systemUptime - began) * 1000)
         }
     }
+    private func sendInformation(_ reply: HTTPResponse, to client: NWConnection) async {
+        await withCheckedContinuation { continuation in
+            client.send(content: reply.wire(), completion: .contentProcessed { _ in continuation.resume() })
+        }
+    }
+
     private func observeStream(_ reply: HTTPResponse, request: HTTPRequest, generation epoch: UInt64) {
         guard generation == epoch else { return }
-        observe(reply, request: request); rememberPhysicalSession(reply, request: request)
+        observe(reply, request: request)
     }
     private func isPhysicalAction(_ path: String, _ parameters: [String: String]) -> Bool {
         if ["/-wvhttp-01-/preset/set", "/-wvhttp-01-/trace/set", "/-wvhttp-01-/trace/control"].contains(path) { return true }
@@ -134,7 +195,10 @@ actor Bridge {
         return keys.contains { ["pan", "tilt", "zoom", "focus", "focus.action", "focus.value", "p"].contains($0) }
     }
     func app(_ request: HTTPRequest) async -> HTTPResponse {
-        guard authenticated(request.headers["authorization"] ?? "") else { return .json(BridgeFailure("Unauthorized helper client", status: 401), status: 401) }
+        guard authenticated(request.headers["authorization"] ?? "") else {
+            diagnostics.record("request_failed", generation: generation, origin: "app", endpoint: request.path, status: 401, reason: "unauthorized")
+            return .json(BridgeFailure("Unauthorized helper client", status: 401), status: 401)
+        }
         do {
             await expire()
             if request.path == "/bridge/status", request.method == "GET" { return .json(status()) }
@@ -170,7 +234,7 @@ actor Bridge {
                 guard pendingPhysicalActions == 0, held.isEmpty, health == "ready" else { throw BridgeFailure("Physical controls or camera route are not ready", status: 409) }
                 if !authorized {
                     let identity = connection!, epoch = generation
-                    try await ensureSession()
+                    _ = try await enqueue(makeRequest("claim.cgi", parameters: [:]), origin: .verify)
                     guard identity == connection, epoch == generation, held.isEmpty, pendingPhysicalActions == 0 else { throw BridgeFailure("Start interrupted by takeover", status: 409) }
                     generation &+= 1; authorized = true; manualTakeover = false
                     diagnostics.record("tracking_authorized", generation: generation, origin: "app")
@@ -195,8 +259,7 @@ actor Bridge {
                     guard pendingPhysicalActions == 0, held.isEmpty, health == "ready", !manualTakeover || origin == .manual || origin == .manualMove else { throw BridgeFailure("Physical controller has priority", status: 409) }
                     if origin == .tracking, !authorized { throw BridgeFailure("Tracking is disabled", status: 409) }
                 }
-                var parameters = command.parameters
-                if let cameraSession { parameters["s"] = cameraSession }
+                let parameters = command.parameters
                 let cameraRequest = makeRequest(command.endpoint, parameters: parameters, method: command.method)
                 let reply: HTTPResponse
                 if read {
@@ -212,54 +275,64 @@ actor Bridge {
                 return .json(BridgeCameraReply(status: reply.status, headers: reply.headers, body: String(decoding: reply.body, as: UTF8.self)))
             default: throw BridgeFailure("Unknown helper operation", status: 404)
             }
-        } catch { return failure(error, origin: "app") }
+        } catch { return failure(error, origin: "app", endpoint: request.path) }
     }
     private func authenticated(_ value: String) -> Bool {
         let expected = Array(("Bearer " + token).utf8), candidate = Array(value.utf8)
         guard expected.count == candidate.count else { return false }
         return zip(expected, candidate).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
-    private func ensureSession() async throws {
-        let epoch = generation
-        if let cached = cameraSession {
-            // Reconfirm this same camera session only at the operator's explicit start.
-            let reply = try await enqueue(makeRequest("claim.cgi", parameters: ["s": cached]), origin: .session)
-            if controlGranted(reply), generation == epoch, cameraSession == cached { return }
-            // 501 definitively identifies an expired camera session. Physical
-            // takeover or a changed session still invalidates this start.
-            guard reply.headers["livescope-status"] == "501", generation == epoch, cameraSession == nil else {
-                throw BridgeFailure("Camera control unavailable or superseded", status: 409)
-            }
-        }
-        let reply = try await enqueue(makeRequest("open.cgi", parameters: ["s.priority": "0"]), origin: .session)
-        guard reply.status == 200, reply.headers["livescope-status"] == "0", let session = fields(reply)["s"] else { throw BridgeFailure("Camera session unavailable", status: 502) }
-        do {
-            guard epoch == generation else { throw BridgeFailure("Session open superseded", status: 409) }
-            let claim = try await enqueue(makeRequest("claim.cgi", parameters: ["s": session]), origin: .session)
-            guard controlGranted(claim) else {
-                throw BridgeFailure("Camera control unavailable", status: 409)
-            }
-            guard epoch == generation else { throw BridgeFailure("Session claim superseded", status: 409) }
-            cameraSession = session
-        } catch {
-            // Only the just-opened private session is closed, never the RC-IP100's.
-            _ = try? await enqueue(makeRequest("close.cgi", parameters: ["s": session]), origin: .session)
-            throw error
+    // Camera recovery stops motion, but a controller still holding a joystick
+    // retains priority. Only release axes whose latest physical input was stop.
+    private func rememberAxisIntent(_ parameters: [String: String]) {
+        for axis in ["pan", "tilt", "zoom", "focus"] {
+            let key = axis == "focus" ? "focus.action" : axis
+            guard let value = parameters[key] ?? parameters["c.1." + key] else { continue }
+            if value == "stop" { releasedAxes.insert(axis) }
+            else { releasedAxes.remove(axis) }
         }
     }
-    private func controlGranted(_ reply: HTTPResponse) -> Bool {
-        // XC may append the remaining privilege duration, e.g. enabled:20000.
-        reply.status == 200 && reply.headers["livescope-status"] == "0" &&
-            fields(reply)["s.control"]?.split(separator: ":", maxSplits: 1).first == "enabled"
+
+    private func lostRoute(duringInactiveStart: Bool = false) {
+        guard !routeLost else { return }
+        routeLost = true
+        health = "unavailable"
+        currentLease = nil
+        routeEpoch &+= 1
+        if duringInactiveStart && !authorized {
+            // The explicit Start still verifies its connection, generation and physical holds.
+            diagnostics.record("camera_session_expired", generation: generation, origin: "helper")
+        } else {
+            revoke("camera_session_expired")
+        }
+        lastMaintenance = -Double.infinity
+    }
+
+    private func accept(_ lease: CameraSessionLease) {
+        if currentLease == nil, !routeLost {
+            diagnostics.record("camera_session_ready", generation: generation, origin: "helper")
+        }
+        currentLease = lease
+        if routeLost {
+            appAxes.removeAll()
+            held.remove("unresolvedAppMotion")
+            held.subtract(releasedAxes)
+            recoveryAxes.subtract(releasedAxes)
+            routeLost = false
+            diagnostics.record("camera_session_recovered", generation: generation, origin: "helper")
+        }
+        health = "ready"
     }
 
     private func enqueue(_ request: HTTPRequest, origin: JobOrigin, neutralizeAppAxes: Bool = false) async throws -> HTTPResponse {
+        guard !stopping else { throw BridgeFailure("Helper is stopping", status: 503) }
         guard jobs.count < 128 else { throw BridgeFailure("Bridge command queue full", status: 503) }
         return try await withCheckedThrowingContinuation { continuation in
-            let job = Job(request: request, origin: origin, generation: generation, connection: connection,
+            let job = Job(request: request, origin: origin, generation: generation, routeEpoch: routeEpoch, connection: connection,
                           requestID: UUID().uuidString, enqueued: ProcessInfo.processInfo.systemUptime,
                           neutralizeAppAxes: neutralizeAppAxes, continuation: continuation)
-            if origin == .controller, let index = jobs.firstIndex(where: { $0.origin != .controller }) { jobs.insert(job, at: index) }
+            if origin == .session { jobs.insert(job, at: 0) }
+            else if origin == .controller, let index = jobs.firstIndex(where: { $0.origin != .controller && $0.origin != .session }) { jobs.insert(job, at: index) }
             else { jobs.append(job) }
             diagnostics.record("enqueued", generation: generation, origin: origin.rawValue, endpoint: request.path,
                                requestID: job.requestID, parameters: (try? request.parameters) ?? [:], queueDepth: jobs.count)
@@ -267,8 +340,8 @@ actor Bridge {
         }
     }
     private func obsolete(_ job: Job) -> Bool {
-        job.origin != .controller && (job.generation != generation || job.connection != connection ||
-            (job.origin == .tracking && !authorized))
+        stopping || job.routeEpoch != routeEpoch || (job.origin != .session && job.origin != .controller && (job.generation != generation || job.connection != connection ||
+            (job.origin == .tracking && !authorized)))
     }
 
     // Called only by the serial camera writer. A controller axis already admitted
@@ -277,7 +350,9 @@ actor Bridge {
         let axes = appAxes.subtracting(held)
         guard !axes.isEmpty else { return }
         do {
-            let stopped = try await upstream.send(stopRequest(for: axes))
+            guard let lease = currentLease else { throw BridgeFailure("Camera session unavailable", status: 502) }
+            let stopped = try await upstream.send(try stopRequest(for: axes).withCameraSession(lease.id))
+            if stopped.cameraControlLost { _ = await sessionOwner.invalidate(lease); lostRoute() }
             guard stopped.status == 200, stopped.headers["livescope-status"] == "0" else {
                 throw BridgeFailure("Camera could not confirm the movement stop", status: 502)
             }
@@ -302,6 +377,25 @@ actor Bridge {
             diagnostics.record("dispatched", generation: generation, origin: job.origin.rawValue, endpoint: job.request.path,
                                requestID: job.requestID, parameters: (try? job.request.parameters) ?? [:], queueDepth: jobs.count, queueWaitMs: queueWait)
             do {
+                if job.origin == .session || job.origin == .verify {
+                    let lease: CameraSessionLease
+                    do {
+                        lease = try await sessionOwner.maintain(forceClaim: job.origin == .verify)
+                    } catch {
+                        guard job.origin == .verify, !authorized, !obsolete(job) else { throw error }
+                        lostRoute(duringInactiveStart: true)
+                        lease = try await sessionOwner.acquire()
+                    }
+                    accept(lease)
+                    job.continuation.resume(returning: HTTPResponse(status: 200))
+                    continue
+                }
+                let lease = try await sessionOwner.acquire()
+                accept(lease)
+                guard !obsolete(job) else {
+                    job.continuation.resume(throwing: BridgeFailure("Superseded during session setup", status: 409))
+                    continue
+                }
                 if (job.origin == .controller && isPhysicalAction(job.request.path, (try? job.request.parameters) ?? [:]) || job.neutralizeAppAxes), !appAxes.isEmpty {
                     do {
                         try await neutralizeAppMotion()
@@ -320,10 +414,18 @@ actor Bridge {
                 // the possibly moving axes. Only a confirmed stop clears an axis.
                 let axesBeforeDispatch = appAxes
                 if job.origin.movesAppAxes { updateAppAxes(job.request, acknowledged: false) }
-                let reply = try await upstream.send(job.request)
-                observe(reply, request: job.request)
+                if job.origin == .controller, let denied = try sessions.localReply(for: job.request) {
+                    job.continuation.resume(returning: denied)
+                    continue
+                }
+                let translated = try job.request.withCameraSession(lease.id)
+                let reply = try await upstream.send(translated)
+                if reply.sessionExpired || (reply.cameraControlLost && (job.origin != .controller || isPhysicalAction(job.request.path, (try? job.request.parameters) ?? [:]))) {
+                    _ = await sessionOwner.invalidate(lease)
+                    lostRoute()
+                }
+                observe(reply, request: translated)
                 if job.origin == .controller, reply.status == 200, reply.headers["livescope-status"] == "0" {
-                    rememberPhysicalSession(reply, request: job.request)
                     updateHeld(job.request)
                     if let parameters = try? job.request.parameters {
                         for key in parameters.keys {
@@ -348,10 +450,12 @@ actor Bridge {
                 diagnostics.record("forwarded", generation: generation, origin: job.origin.rawValue, endpoint: job.request.path, status: reply.status,
                                    requestID: job.requestID, parameters: (try? job.request.parameters) ?? [:], livescope: reply.headers["livescope-status"],
                                    queueDepth: jobs.count, queueWaitMs: queueWait,
-                                   durationMs: (ProcessInfo.processInfo.systemUptime - started) * 1000)
+                                   durationMs: (ProcessInfo.processInfo.systemUptime - started) * 1000,
+                                   details: DiagnosticDetails.response(reply, request: job.request, cameraHost: upstream.url.host))
                 job.continuation.resume(returning: reply)
             } catch {
-                health = "unavailable"; revoke("camera_route_failed")
+                if job.origin == .session || job.origin == .verify { lostRoute() }
+                else { health = "unavailable"; revoke("camera_route_failed") }
                 // A timed-out app move may already be moving the real camera.
                 // Send only a scoped stop; never replay the movement request.
                 if job.origin.movesAppAxes {
@@ -374,8 +478,7 @@ actor Bridge {
         _ = try await enqueue(stopRequest(for: axes), origin: .stop)
     }
     private func stopRequest(for axes: Set<String>) -> HTTPRequest {
-        var parameters = Dictionary(uniqueKeysWithValues: axes.map { ($0 == "focus" ? "focus.action" : $0, "stop") })
-        if let cameraSession { parameters["s"] = cameraSession }
+        let parameters = Dictionary(uniqueKeysWithValues: axes.map { ($0 == "focus" ? "focus.action" : $0, "stop") })
         return makeRequest("control.cgi", parameters: parameters)
     }
     private func updateAppAxes(_ request: HTTPRequest, acknowledged: Bool) {
@@ -392,30 +495,25 @@ actor Bridge {
         if appAxes.isEmpty { held.remove("unresolvedAppMotion") }
     }
     private func makeRequest(_ endpoint: String, parameters: [String: String], method: String = "GET") -> HTTPRequest {
-        var components = URLComponents()
-        components.queryItems = parameters.sorted(by: { $0.key < $1.key }).map { URLQueryItem(name: $0.key, value: $0.value) }
-        let query = (components.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
-        return HTTPRequest(method: method, target: "/-wvhttp-01-/" + endpoint + (method == "GET" && !query.isEmpty ? "?" + query : ""),
-                           headers: ["content-type": "application/x-www-form-urlencoded"], body: method == "POST" ? Data(query.utf8) : Data())
+        .canon(endpoint, parameters: parameters, method: method)
     }
     private func fields(_ reply: HTTPResponse) -> [String: String] {
         BridgeCameraReply(status: reply.status, headers: reply.headers, body: String(decoding: reply.body, as: UTF8.self)).fields
     }
     private func observe(_ reply: HTTPResponse, request: HTTPRequest) {
-        if reply.headers["livescope-status"] == "501", let usedSession = (try? request.parameters)?["s"],
-           cameraSession == usedSession {
-            cameraSession = nil
-            health = "unavailable"
-            if authorized { revoke("camera_session_expired") }
-        }
         guard reply.status == 200, reply.headers["livescope-status"] == "0" else { return }
-        health = "ready"
-        let values = fields(reply), parameters = try? request.parameters
-        if request.path.hasSuffix("claim.cgi"), controlGranted(reply) { cameraSession = parameters?["s"] }
-        if request.path.hasSuffix("close.cgi"), parameters?["s"] == cameraSession { cameraSession = nil }
+        if !routeLost { health = "ready" }
+        let values = fields(reply)
         if request.path.hasSuffix("info.cgi") {
             if ["idle", "prepared"].contains(values["t.status"] ?? "") { held.remove("tracePlayback") }
             if ["c.1.pan.status", "c.1.tilt.status", "c.1.zoom.status"].allSatisfy({ values[$0] == "0" }) { held.remove("position") }
+            // Auto mode resolves only the unknown focus state inherited at startup.
+            // A physical near/far command still requires its own acknowledged stop.
+            if awaitingStartupFocusMode, pendingPhysicalActions == 0, values["c.1.focus"] == "auto" {
+                recoveryAxes.remove("focus")
+                held.remove("focus")
+                awaitingStartupFocusMode = false
+            }
             if recovering, recoveryAxes.isEmpty,
                ["idle", "prepared"].contains(values["t.status"] ?? ""),
                ["c.1.pan.status", "c.1.tilt.status", "c.1.zoom.status"].allSatisfy({ values[$0] == "0" }) {
@@ -423,12 +521,6 @@ actor Bridge {
                 diagnostics.record("recovery_releases_confirmed", generation: generation, origin: "controller")
             }
         }
-    }
-    private func rememberPhysicalSession(_ reply: HTTPResponse, request: HTTPRequest) {
-        guard reply.status == 200, reply.headers["livescope-status"] == "0",
-              !request.path.hasSuffix("close.cgi"), !request.path.hasSuffix("yield.cgi"),
-              let session = (try? request.parameters)?["s"] else { return }
-        cameraSession = session
     }
     private func updateHeld(_ request: HTTPRequest, releasing: Bool = true) {
         guard let input = try? request.parameters else { return }
@@ -442,10 +534,16 @@ actor Bridge {
                 }
             }
             if let focus = parameters["focus.action"] {
-                if ["near", "far"].contains(focus) { held.insert("focus") }
+                if ["near", "far"].contains(focus) {
+                    awaitingStartupFocusMode = false
+                    held.insert("focus")
+                }
                 else if releasing {
                     if !recovering || focus == "stop" { held.remove("focus") }
-                    if focus == "stop" { recoveryAxes.remove("focus") }
+                    if focus == "stop" {
+                        awaitingStartupFocusMode = false
+                        recoveryAxes.remove("focus")
+                    }
                 }
             }
             if parameters["p"] != nil { held.insert("position") }
@@ -459,12 +557,25 @@ actor Bridge {
             else { held.insert("tracePlayback") }
         }
     }
-    private func failure(_ error: Error, origin: String) -> HTTPResponse {
+    private func failure(_ error: Error, origin: String, endpoint: String = "") -> HTTPResponse {
         let failure: BridgeFailure
         if let known = error as? BridgeFailure { failure = known }
         else if let http = error as? HTTPError { failure = BridgeFailure(http.message, status: http.status) }
         else { failure = BridgeFailure("Camera connection failed; command was not replayed", status: 502) }
-        diagnostics.record("request_failed", generation: generation, origin: origin, status: failure.status)
+        let reason: String
+        switch failure.error {
+        case "Stale app lease": reason = "stale_lease"
+        case "Tracking is disabled": reason = "tracking_disabled"
+        case "Physical action is pending": reason = "pending_physical"
+        case "Physical controls or camera route are not ready", "Physical controller has priority":
+            reason = recovering ? "recovery_required" : pendingPhysicalActions > 0 ? "pending_physical" : !held.isEmpty ? "held_controls" : health != "ready" ? "route_unready" : "manual_takeover"
+        case "Unsupported helper protocol version": reason = "protocol_version"
+        case "Camera route is not ready": reason = "route_unready"
+        case "Start interrupted by takeover", "App connection superseded", "Stop lease superseded": reason = "superseded"
+        default: reason = failure.status >= 500 ? "camera_unavailable" : "invalid_operation"
+        }
+        diagnostics.record("request_failed", generation: generation, origin: origin, endpoint: endpoint, status: failure.status,
+                           reason: reason, details: DiagnosticDetails(recoveryRequired: recovering, pendingPhysical: pendingPhysicalActions > 0, heldControls: !held.isEmpty))
         return .json(failure, status: failure.status)
     }
 }

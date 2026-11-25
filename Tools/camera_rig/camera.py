@@ -52,6 +52,8 @@ class CameraSimulator:
                                                if k.removeprefix("c.1.") in allowed},
                                 "http_status": status, "livescope": str(livescope) if livescope is not None else None,
                                 "fault": fault,
+                                "session_fingerprint": hashlib.sha256(parameters["s"].encode()).hexdigest()[:16]
+                                    if parameters.get("s") else None,
                                 "wire_fingerprint": fingerprint})
 
     def admin(self, method, path, data):
@@ -74,6 +76,11 @@ class CameraSimulator:
                     raise ValueError("advance requires manual clock")
                 self.model.step(float(data["seconds"]))
                 return {"elapsed": self.model.elapsed}
+            if path == "expire-sessions" and method == "POST":
+                # Camera control privilege expires independently of commanded motion.
+                self.model.sessions.clear()
+                self.model.owner = None
+                return {"ok": True}
             if path == "reset" and method == "POST":
                 old_sessions, old_owner = self.model.sessions, self.model.owner
                 self.model = CameraModel(self.clock, self.model.ownership)
@@ -249,7 +256,8 @@ class CameraSimulator:
                         self.reply(200, payload)
                 except ProtocolError as error:
                     simulator.record(endpoint, parameters, self.command, actor, 200, error.status, fingerprint)
-                    self.reply(200, str(error).encode(), livescope=error.status)
+                    scope = "501 Unknown Connection ID" if error.status == 501 else error.status
+                    self.reply(200, str(error).encode(), livescope=scope)
                 except (ValueError, KeyError, TypeError, UnicodeError):
                     self.close_connection = True
                     self.reply(400, b"Invalid request\n", livescope="403")

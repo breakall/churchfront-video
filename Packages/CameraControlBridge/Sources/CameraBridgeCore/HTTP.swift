@@ -15,11 +15,14 @@ struct HTTPRequest: Sendable {
             for text in [query, form] where !text.isEmpty {
                 for part in text.split(separator: "&", omittingEmptySubsequences: false) {
                     let pair = part.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                    if part.isEmpty && path == "/-wvhttp-01-/info.cgi" { continue }
                     guard let first = pair.first, !first.isEmpty,
                           let key = String(first).replacingOccurrences(of: "+", with: " ").removingPercentEncoding,
-                          let value = (pair.count == 2 ? String(pair[1]) : "").replacingOccurrences(of: "+", with: " ").removingPercentEncoding,
-                          values[key] == nil else { throw HTTPError(400, "Ambiguous form parameters") }
-                    values[key] = value
+                          let value = (pair.count == 2 ? String(pair[1]) : "").replacingOccurrences(of: "+", with: " ").removingPercentEncoding else { throw HTTPError(400, "Ambiguous form parameters") }
+                    if let previous = values[key] {
+                        guard key == "item", path == "/-wvhttp-01-/info.cgi" else { throw HTTPError(400, "Ambiguous form parameters") }
+                        values[key] = previous + "," + value
+                    } else { values[key] = value }
                 }
             }
             return values
@@ -31,12 +34,17 @@ struct HTTPResponse: Sendable {
     var status: Int
     var headers: [String: String] = [:]
     var body = Data()
+    var originalWire: Data? = nil
+    var sessionExpired: Bool {
+        status == 200 && headers["livescope-status"]?.split(whereSeparator: \.isWhitespace).first == "501"
+    }
     static func json<T: Encodable>(_ value: T, status: Int = 200) -> HTTPResponse {
         HTTPResponse(status: status, headers: ["content-type": "application/json"],
                      body: (try? JSONEncoder().encode(value)) ?? Data())
     }
     func wire() -> Data {
-        var data = Data("HTTP/1.1 \(status) Response\r\n".utf8)
+        if let originalWire { return originalWire }
+        var data = Data("HTTP/1.1 \(status) \(status == 200 ? "OK" : "Response")\r\n".utf8)
         let excluded = Set(["connection", "content-length", "transfer-encoding", "keep-alive", "proxy-connection", "trailer"])
         for (key, value) in headers where !excluded.contains(key.lowercased()) && !value.contains("\r") && !value.contains("\n") {
             data.append(Data("\(key): \(value)\r\n".utf8))
@@ -49,6 +57,20 @@ struct HTTPResponse: Sendable {
 struct HTTPError: Error {
     var status: Int; var message: String
     init(_ status: Int, _ message: String) { self.status = status; self.message = message }
+    var diagnosticReason: String {
+        switch message {
+        case "Request too large": return "request_too_large"
+        case "Headers too large": return "header_limit"
+        case "Invalid headers", "Invalid header": return "invalid_headers"
+        case "Invalid request line": return "invalid_request_line"
+        case "Duplicate header": return "duplicate_header"
+        case "Unsupported request framing": return "unsupported_framing"
+        case "Invalid body size": return "invalid_body_size"
+        case "Pipelining not supported": return "pipelining"
+        case "Incomplete request": return "incomplete_request"
+        default: return "other"
+        }
+    }
 }
 
 final class HTTPListener: @unchecked Sendable {
@@ -68,6 +90,7 @@ final class HTTPListener: @unchecked Sendable {
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     var handler: (@Sendable (HTTPRequest) async -> HTTPResponse)?
     var streamHandler: (@Sendable (HTTPRequest, NWConnection) async -> Void)?
+    var diagnostic: (@Sendable (String, String, HTTPRequest?) -> Void)?
     func start(host: String, port: UInt16, allowedSource: String) async throws -> UInt16 {
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
@@ -88,17 +111,25 @@ final class HTTPListener: @unchecked Sendable {
                 guard let self else { connection.cancel(); return }
                 let source: String
                 if case .hostPort(let host, _) = connection.endpoint { source = "\(host)" } else { source = "" }
-                guard source == allowedSource || (allowedSource == "127.0.0.1" && source == "::ffff:127.0.0.1"),
-                      self.connections.count < 64 else { connection.cancel(); return }
+                guard source == allowedSource || (allowedSource == "127.0.0.1" && source == "::ffff:127.0.0.1") else {
+                    self.diagnostic?("listener_rejected", "source_denied", nil); connection.cancel(); return
+                }
+                guard self.connections.count < 64 else {
+                    self.diagnostic?("listener_rejected", "connection_limit", nil); connection.cancel(); return
+                }
                 let id = ObjectIdentifier(connection)
                 self.connections[id] = connection
                 connection.start(queue: self.queue)
-                let deadline = Deadline(queue: self.queue) { [weak self] in connection.cancel(); self?.connections.removeValue(forKey: id) }
+                let deadline = Deadline(queue: self.queue) { [weak self] in
+                    self?.diagnostic?("listener_rejected", "request_deadline", nil)
+                    connection.cancel(); self?.connections.removeValue(forKey: id)
+                }
                 self.receive(connection, buffer: Data()) { [weak self] request in
                     Task {
                         let response: HTTPResponse
                         do {
                             let request = try request.get()
+                            self?.diagnostic?("listener_request", "", request)
                             if request.path == "/-wvhttp-01-/info.cgi", let stream = self?.streamHandler {
                                 deadline.cancel()
                                 await stream(request, connection)
@@ -108,8 +139,11 @@ final class HTTPListener: @unchecked Sendable {
                             }
                             response = await self?.handler?(request) ?? HTTPResponse(status: 503)
                         }
-                        catch let error as HTTPError { response = .json(["error": error.message], status: error.status) }
-                        catch { response = HTTPResponse(status: 400) }
+                        catch let error as HTTPError {
+                            self?.diagnostic?("listener_rejected", error.diagnosticReason, nil)
+                            response = .json(["error": error.message], status: error.status)
+                        }
+                        catch { self?.diagnostic?("listener_rejected", "other", nil); response = HTTPResponse(status: 400) }
                         connection.send(content: response.wire(), completion: .contentProcessed { _ in
                             deadline.cancel(); connection.cancel()
                             self?.queue.async { [weak self] in self?.connections.removeValue(forKey: id) }

@@ -369,23 +369,21 @@ def camera_restart_session_recovery(app, hardware, admin, bridge):
     equal(admin.admin("state")["commanded_axes"], [], "recovered camera accepted move and stop")
 
 
-def takeover_during_session_open(app, hardware, admin, bridge):
+def takeover_during_tracking_start(app, hardware, admin, bridge):
     lease = app.connect()
-    admin.admin("fault", {"mode": "delay_after", "seconds": 0.4, "endpoint": "open.cgi"})
+    admin.admin("fault", {"mode": "delay_after", "seconds": 0.4, "endpoint": "info.cgi"})
     result = []
     worker = threading.Thread(target=lambda: result.append(app.request("start", lease)))
     worker.start()
     try:
-        wait_camera_event(admin, lambda event: event["endpoint"] == "open.cgi")
+        wait_camera_event(admin, lambda event: event.get("fault") == "delay_after")
         hardware.focus("far").require_ok()
     finally:
         worker.join(timeout=3)
-    equal(len(result), 1, "start completed after the delayed session open")
+    equal(len(result), 1, "start completed after the delayed inspection")
     rejection(result[0])
-    events = admin.admin("events")["events"]
-    equal(any(event["endpoint"] == "claim.cgi" for event in events), False, "superseded app start never claims control")
-    equal(any(event["endpoint"] == "close.cgi" for event in events), True, "abandoned app session closed")
-    equal(app.status()["authorized"], False, "app stays disarmed")
+    equal(app.status()["authorized"], False, "physical takeover supersedes an in-flight tracking start")
+    equal(admin.admin("state")["info"]["c.1.focus.action"], "far", "physical focus keeps control")
 
 
 def takeover_during_manual_cleanup(app, hardware, admin, bridge):
@@ -720,7 +718,13 @@ def concurrent_stop_and_disconnect(app, hardware, admin, bridge):
 
 def exclusive_session_recovery(app, hardware, admin, bridge):
     hardware.connect().require_ok()
+    with Controller(bridge.camera_url) as observer:
+        observer_session = observer.command("open.cgi").require_ok().fields["s"]
+        info = hardware.command("info.cgi", {"s": observer_session})
+        equal(info.livescope.split()[0], "501", "camera session credentials cannot be used on the controller listener")
+        observer.command("close.cgi", {"s": observer_session}).require_ok()
     lease = app.start(app.connect())
+    equal(hardware.info().require_ok().fields["s.control"], "enabled", "status poll cannot replace the controller session")
     command_ok(app.command(lease, {"pan": "left", "pan.speed": "100"}))
     admin.admin("fault", {"mode": "disconnect", "endpoint": "control.cgi"})
     if app.command(lease, {"pan": "left", "pan.speed": "100"}).status < 400:
@@ -732,6 +736,133 @@ def exclusive_session_recovery(app, hardware, admin, bridge):
     hardware.move("right").require_ok()
     equal(app.status()["authorized"], False, "physical controller still takes over after session recovery")
     equal(admin.admin("state")["commanded_axes"], ["pan"], "recovered helper never steals controller session")
+
+
+def virtual_controller_lifecycle(app, hardware, admin, bridge):
+    wait_camera_event(admin, lambda e: e["endpoint"] == "claim.cgi" and e["livescope"] == "0", timeout=5)
+    upstream_claim = next(e for e in admin.admin("events")["events"] if e["endpoint"] == "claim.cgi")
+    opened = hardware.command("open.cgi", {"s.priority": "4"}).require_ok()
+    hardware.session = opened.fields["s"]
+    downstream = hashlib.sha256(hardware.session.encode()).hexdigest()[:16]
+    equal(opened.fields["s.origin"].removeprefix("http://").rstrip("/"),
+          bridge.controller_url.removeprefix("http://"), "controller origin points back to bridge")
+    if upstream_claim["session_fingerprint"] in (None, downstream):
+        raise AssertionError("controller and camera must use separate session IDs")
+    hardware.claim().require_ok()
+    controller_session = hardware.session
+    hardware.move("right").require_ok()
+    hardware.move().require_ok()
+    hardware.command("yield.cgi").require_ok()
+    equal(hardware.info().require_ok().fields["s.control"], "disabled", "yield updates the virtual info view")
+    equal(hardware.move("left").livescope.split()[0], "301", "yielded controller cannot issue movement")
+    hardware.claim().require_ok()
+    equal(hardware.info().require_ok().fields["s.control"], "enabled", "claim restores the virtual info view")
+    hardware.release().require_ok()
+    equal(hardware.command("info.cgi", {"s": controller_session}).livescope.split()[0], "501",
+          "closed controller session is invalidated locally")
+    hardware.connect().require_ok()
+    equal(hardware.session != controller_session, True, "reopen gets a fresh controller credential")
+    hardware.zoom("tele").require_ok()
+    hardware.zoom("stop").require_ok()
+    hardware.release().require_ok()
+    events = admin.admin("events")["events"]
+    for endpoint in ("close.cgi", "yield.cgi"):
+        equal(any(e["endpoint"] == endpoint for e in events), False, "controller lifecycle stays local")
+    equal(sum(e["endpoint"] == "open.cgi" for e in events), 1, "controller reopens reuse one camera session")
+    for event in events:
+        if event["endpoint"] in ("claim.cgi", "control.cgi"):
+            equal(event["session_fingerprint"], upstream_claim["session_fingerprint"], "camera-side credential is stable")
+    equal(admin.admin("state")["session_count"], 1, "controller close leaves upstream session open")
+
+
+def idle_session_maintenance(app, hardware, admin, bridge):
+    wait_camera_event(admin, lambda e: e["endpoint"] == "claim.cgi" and e["livescope"] == "0", timeout=5)
+    initial = admin.admin("events")
+    first_claim = next(e for e in initial["events"] if e["endpoint"] == "claim.cgi")
+    wait_camera_event(admin, lambda e: e["endpoint"] == "claim.cgi" and e["livescope"] == "0"
+                      and e["sequence"] > initial["last_sequence"]
+                      and e["session_fingerprint"] == first_claim["session_fingerprint"], timeout=10)
+    admin.admin("expire-sessions", {})
+    wait_camera_event(admin, lambda e: e["endpoint"] == "claim.cgi" and e["livescope"] == "0"
+                      and e["session_fingerprint"] != first_claim["session_fingerprint"], timeout=12)
+    equal(admin.admin("state")["session_count"], 1, "idle helper reclaims one session after expiration")
+    equal(app.status()["authorized"], False, "camera maintenance does not authorize tracking")
+
+
+def release_during_session_expiry(app, hardware, admin, bridge):
+    hardware.connect().require_ok()
+    controller_session = hardware.session
+    lease = app.start(app.connect())
+    command_ok(app.command(lease, {"pan": "left"}))
+    hardware.move("right").require_ok()
+    assert_revoked(app, lease, admin)
+    before = admin.admin("events")["last_sequence"]
+    admin.admin("expire-sessions", {})
+    equal(admin.admin("state")["commanded_axes"], ["pan"], "loss of session did not stop physical pan")
+    hardware.move()  # May report the original rejection. The recovery stop must still be acknowledged.
+    wait_camera_event(admin, lambda e: e["sequence"] > before and e["endpoint"] == "control.cgi" and e["livescope"] == "0"
+                      and e["parameters"].get("pan") == e["parameters"].get("tilt")
+                      == e["parameters"].get("zoom") == e["parameters"].get("focus.action") == "stop",
+                      timeout=8)
+    equal(admin.admin("state")["commanded_axes"], [], "camera stopped before admitting any new movement")
+    equal(app.status()["authorized"], False, "recovery leaves tracking off")
+    hardware.info().require_ok()
+    hardware.move("left", speed=37).require_ok()
+    hardware.move().require_ok()
+    equal(hardware.session, controller_session, "same controller session accepted fresh movement")
+    rejection(app.command(lease, {"tilt": "up"}))
+    command_ok(app.command(app.start(app.current(lease)), {"pan": "left", "pan.speed": "234"}))
+    writes = camera_writes(admin)
+    equal(sum(e["parameters"].get("pan") == "right" for e in writes), 1, "expired motion was not replayed")
+    equal(writes[-1]["parameters"].get("pan.speed"), "234", "only fresh tracking move followed recovery")
+
+
+def queued_movement_dropped_on_session_loss(app, hardware, admin, bridge):
+    hardware.connect().require_ok()
+    lease = app.start(app.connect())
+    hardware.move("right", speed=100).require_ok()
+    admin.admin("expire-sessions", {})
+    admin.admin("fault", {"mode": "delay", "seconds": 0.8, "endpoint": "control.cgi"})
+
+    def invoke(peer, pan, speed):
+        # All peers represent overlapping HTTP requests from the same RC-IP100 session.
+        peer.session = hardware.session
+        peer.move(pan, speed=speed)
+
+    def wait_job(decision, speed):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            for line in bridge.diagnostics_file.read_bytes().splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if event["decision"] == decision and event["parameters"].get("pan.speed") == str(speed):
+                    return
+            time.sleep(0.005)
+        raise AssertionError("expected physical job was not visible in helper diagnostics")
+
+    with Controller(bridge.controller_url) as first, Controller(bridge.controller_url) as queued:
+        in_flight = threading.Thread(target=invoke, args=(first, "left", 571))
+        stale = threading.Thread(target=invoke, args=(queued, "right", 572))
+        in_flight.start()
+        try:
+            wait_job("dispatched", 571)
+            stale.start()
+            wait_job("enqueued", 572)
+            hardware.move()
+        finally:
+            in_flight.join(timeout=3)
+            if stale.ident is not None:
+                stale.join(timeout=3)
+    wait_camera_event(admin, lambda e: e["parameters"].get("focus.action") == "stop", timeout=8)
+    writes = camera_writes(admin)
+    equal([e["livescope"] for e in writes if e["parameters"].get("pan.speed") == "571"], ["501"],
+          "only the original attempted movement reached the expired camera session")
+    equal(any(e["parameters"].get("pan.speed") == "572" for e in writes), False,
+          "queued movement never reaches the replacement session")
+    equal(admin.admin("state")["commanded_axes"], [], "outage release resolves through a confirmed stop")
+    command_ok(app.command(app.start(app.current(lease)), {"pan": "stop"}))
 
 
 def cleanup_failure_still_forwards_physical_action(app, hardware, admin, bridge):
@@ -849,6 +980,12 @@ def helper_restart_with_held_joystick(app, hardware, admin, bridge):
         with Controller(restarted.controller_url) as recovered_hardware:
             recovered_hardware.move().require_ok()
             recovered_hardware.zoom("stop").require_ok()
+            recovered_hardware.info().require_ok()
+            equal(recovered_app.status()["heldAxes"], [], "confirmed autofocus clears startup focus without a focus stop")
+            command_ok(recovered_app.command(recovered_app.current(recovered_lease), {"pan": "stop"}, purpose="manualMove"))
+            recovered_hardware.focus("near").require_ok()
+            recovered_hardware.info().require_ok()
+            rejection(recovered_app.request("start", recovered_app.current(recovered_lease)))
             recovered_hardware.focus("stop").require_ok()
             recovered_app.start(recovered_app.current(recovered_lease))
         equal(recovered_app.status()["authorized"], True, "explicit hardware stops clear restart recovery fence")
@@ -880,7 +1017,7 @@ OWNERSHIP_SCENARIOS = (
     ("disconnect_during_first_tracking_move", revoke_during_first_move("disconnect"), {}),
     ("uncertain_app_motion_stops_without_replay", ambiguous_app_motion, {"extra_args": ("--request-timeout", "0.15")}),
     ("expired_camera_session_recovered_on_explicit_start", camera_restart_session_recovery, {"camera_ownership": "exclusive"}),
-    ("physical_takeover_during_camera_session_open", takeover_during_session_open, {}),
+    ("physical_takeover_during_tracking_start", takeover_during_tracking_start, {}),
     ("physical_takeover_during_manual_move_cleanup", takeover_during_manual_cleanup, {}),
     ("absolute_focus_takeover", physical_trigger(no_setup, lambda h: h.command("control.cgi", {"c.1.focus.value": "500"})), {}),
     ("camera_failure_disarms_without_replay", camera_failure, {}),
@@ -894,6 +1031,10 @@ OWNERSHIP_SCENARIOS = (
     ("completed_preset_allows_explicit_restart_with_fresh_evidence", completed_preset_allows_explicit_restart, {}),
     ("absolute_app_motion_then_store_revokes", absolute_app_motion_then_store, {}),
     ("concurrent_stop_disconnect_keeps_helper_alive", concurrent_stop_and_disconnect, {}),
+    ("queued_physical_movement_is_discarded_on_session_loss", queued_movement_dropped_on_session_loss, {"camera_ownership": "exclusive"}),
+    ("idle_upstream_session_renewal", idle_session_maintenance, {"camera_ownership": "exclusive"}),
+    ("virtual_controller_lifecycle_is_independent", virtual_controller_lifecycle, {"camera_ownership": "exclusive"}),
+    ("release_during_session_expiry_stops_before_restart", release_during_session_expiry, {"camera_ownership": "exclusive"}),
     ("exclusive_controller_session_survives_route_recovery", exclusive_session_recovery, {"camera_ownership": "exclusive"}),
     ("cleanup_failure_still_forwards_physical_action", cleanup_failure_still_forwards_physical_action, {}),
     ("streaming_info_reaches_controller_before_completion", streaming_info_forwards_before_completion, {}),

@@ -8,6 +8,7 @@ public final class BridgeService {
     private var controller: HTTPListener?
     private var app: HTTPListener?
     private var diagnosticsRefresh: Task<Void, Never>?
+    private var bridge: Bridge?
     private var timer: Task<Void, Never>?
     private var lockDescriptor: Int32 = -1
     private let configuration: BridgeConfiguration
@@ -48,16 +49,27 @@ public final class BridgeService {
         let diagnostics = Diagnostics(enabled: configuration.diagnosticsEnabled, path: logPath,
                                       helperBuild: identity, configurationID: configuration.identity)
         let bridge = Bridge(configuration: configuration, token: token, diagnostics: diagnostics, helperBuild: identity, recovering: recovering)
+        self.bridge = bridge
         let controller = HTTPListener(), app = HTTPListener()
+        for (listener, origin) in [(controller, "controller"), (app, "app")] {
+            listener.diagnostic = { event, reason, request in
+                // Listener events precede the actor's generation assignment.
+                diagnostics.record(event, generation: 0, origin: origin, endpoint: request?.path ?? "",
+                                   requestID: UUID().uuidString, reason: reason.isEmpty ? nil : reason,
+                                   details: request.map(DiagnosticDetails.request))
+            }
+        }
         self.controller = controller; self.app = app
         controller.handler = { request in await bridge.physical(request) }
         controller.streamHandler = { request, client in await bridge.streamInformation(request, client: client) }
         app.handler = { request in await bridge.app(request) }
         let controllerPort = try await controller.start(host: configuration.listenHost, port: configuration.controllerPort,
                                                         allowedSource: configuration.controllerAddress)
+        await bridge.bindController(port: controllerPort)
         let appPort = try await app.start(host: "127.0.0.1", port: configuration.appPort, allowedSource: "127.0.0.1")
         timer = Task {
             while !Task.isCancelled {
+                await bridge.maintain()
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 if !Task.isCancelled { await bridge.expire() }
             }
@@ -85,6 +97,13 @@ public final class BridgeService {
         let host = configuration.listenHost.contains(":") ? "[\(configuration.listenHost)]" : configuration.listenHost
         return ["controller_url": "http://\(host):\(controllerPort)", "app_url": "http://127.0.0.1:\(appPort)", "token_file": configuration.tokenFile,
                 "configuration_id": configuration.identity, "helper_build": identity]
+    }
+    public func shutdown() async {
+        timer?.cancel()
+        controller?.stop()
+        app?.stop()
+        await bridge?.shutdown()
+        stop()
     }
     public func stop() {
         diagnosticsRefresh?.cancel(); timer?.cancel(); controller?.stop(); app?.stop()
