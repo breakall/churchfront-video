@@ -14,11 +14,11 @@ enum CameraPicture {
         return store.ndi(c.atemInput).map { .ndi($0) }
     }
 
-    /// Every new frame, on the main thread.
+    /// Frames published after subscription. The cached image can predate a manual reframe.
     var frames: AnyPublisher<CGImage, Never> {
         switch self {
-        case .canon(let c): return CanonFeedHub.shared.feed(for: c).$image.compactMap { $0 }.eraseToAnyPublisher()
-        case .ndi(let n): return NDIFeedHub.shared.feed(n).$image.compactMap { $0 }.eraseToAnyPublisher()
+        case .canon(let c): return CanonFeedHub.shared.feed(for: c).$image.dropFirst().compactMap { $0 }.eraseToAnyPublisher()
+        case .ndi(let n): return NDIFeedHub.shared.feed(n).$image.dropFirst().compactMap { $0 }.eraseToAnyPublisher()
         }
     }
 

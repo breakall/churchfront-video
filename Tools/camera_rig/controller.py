@@ -86,7 +86,7 @@ class Controller:
             raise
 
     def command(self, endpoint, parameters=None, *, method="GET"):
-        if endpoint not in ("info.cgi", "control.cgi", "open.cgi", "claim.cgi", "yield.cgi", "close.cgi",
+        if endpoint not in ("info.cgi", "control.cgi", "open.cgi", "session.cgi", "claim.cgi", "yield.cgi", "close.cgi",
                             "preset/set", "trace/set", "trace/control"):
             raise ValueError("unsupported rig command endpoint")
         parameters = dict(parameters or {})

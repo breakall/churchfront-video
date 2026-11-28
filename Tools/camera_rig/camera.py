@@ -180,9 +180,13 @@ class CameraSimulator:
                     pairs = parse_qsl(parsed.query, keep_blank_values=True)
                     if body:
                         pairs += parse_qsl(body.decode("ascii"), keep_blank_values=True)
-                    if len({key for key, _ in pairs}) != len(pairs):
-                        raise ProtocolError(403, "duplicate parameter")
-                    parameters = dict(pairs)
+                    parameters = {}
+                    for key, value in pairs:
+                        if key in parameters:
+                            if endpoint != "info.cgi" or key != "item":
+                                raise ProtocolError(403, "duplicate parameter")
+                            value = parameters[key] + "," + value
+                        parameters[key] = value
                     fault = simulator.take_fault(endpoint)
                     if fault:
                         mode = fault["mode"]

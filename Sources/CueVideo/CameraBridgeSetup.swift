@@ -1,4 +1,5 @@
 import SwiftUI
+import CameraBridgeClient
 
 struct CameraBridgeSetup: View {
     @EnvironmentObject var store: ConfigStore
@@ -24,9 +25,11 @@ struct CameraBridgeSetup: View {
                 Text("Register the Mac listener address and port as the camera destination on the RC-IP100. The bridge uses the single Canon camera configured above.")
                     .font(.sans(12)).foregroundStyle(T.inkMuted)
                 Toggle("Use RC-IP100 tracking control for Churchfront", isOn: $draft.nativeTrackingControl)
-                    .disabled(true)
-                Text("Native tracking interception will be available after its controller commands have been verified. Use Churchfront's Track control in this build.")
-                    .font(.sans(12)).foregroundStyle(T.inkMuted)
+                    .disabled(ControllerTrackingPress.rcIP100Mapping == nil)
+                if ControllerTrackingPress.rcIP100Mapping == nil {
+                    Text("Native tracking interception will be available after its controller commands have been verified. Use Churchfront's Track control in this build.")
+                        .font(.sans(12)).foregroundStyle(T.inkMuted)
+                }
                 Toggle("Detailed bridge diagnostics", isOn: $draft.diagnosticsEnabled)
                 HStack(spacing: T.s2) {
                     Button("Apply bridge settings") { store.update { $0.cameraBridge = draft } }

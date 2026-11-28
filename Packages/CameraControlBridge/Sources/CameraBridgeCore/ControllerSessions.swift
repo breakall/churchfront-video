@@ -38,6 +38,7 @@ struct ControllerSessionView: Sendable {
     let priority: Int
     let infoItems: String?
     let isInfo: Bool
+    var axisSpeeds: [String: String] = [:]
 
     static func xc(_ code: String, _ body: String = "") -> HTTPResponse {
         HTTPResponse(status: 200, headers: ["livescope-status": code, "content-type": "text/plain; charset=utf-8",
@@ -81,6 +82,7 @@ struct ControllerSessionView: Sendable {
                 seen.insert(key)
                 return value(for: key).map { key + separator + $0 }
             }
+            if axisSpeeds[key] != nil { seen.insert(key) }
             break
         }
         return line
@@ -88,8 +90,8 @@ struct ControllerSessionView: Sendable {
 
     func missingFields(seen: Set<String>) -> [String] {
         guard isInfo, sessionID != nil else { return [] }
-        return Self.sessionKeys.compactMap { key in
-            guard !seen.contains(key), requested(key), let value = value(for: key) else { return nil }
+        return (Self.sessionKeys + axisSpeeds.keys.sorted()).compactMap { key in
+            guard !seen.contains(key), requested(key), let value = value(for: key) ?? axisSpeeds[key] else { return nil }
             return key + ":=" + value
         }
     }
@@ -109,15 +111,65 @@ struct ControllerSessionView: Sendable {
         let rendered = text.split(whereSeparator: \.isNewline).compactMap { renderLine(String($0), seen: &seen) }
         if sessionID == nil && seen.isEmpty { return result }
         let fields = rendered + missingFields(seen: seen)
-        result.body = Data((fields.joined(separator: "\r\n") + (fields.isEmpty ? "" : "\r\n")).utf8)
+        let separator = text.contains("\r\n") ? "\r\n" : "\n"
+        result.body = Data((fields.joined(separator: separator) + (fields.isEmpty ? "" : separator)).utf8)
         return result
     }
 }
 
+/// The CR-N500's default open uses LF lines and includes the negotiated video
+/// descriptor before the client sends any claim or information request.
+struct CanonDefaultOpen: Equatable, Sendable {
+    let authorities: [String]
+    let video: String
+    var axisSpeeds: [String: String] = [:]
+
+    // These settings belong to the Canon session. Unscoped camera snapshots
+    // contain the ranges but omit the session's speed, ratio and mode values.
+    static let axisSpeedKeys = Set(["pan", "tilt"].flatMap { axis in
+        ["dir", "pos", "ratio.dir", "ratio.pos", "mode.dir", "mode.pos"].map { "c.1." + axis + ".speed." + $0 }
+    })
+
+    init?(_ fields: [String: String]) {
+        let keys = ["s.authority.audio", "s.authority.control", "s.authority.video"]
+        var authorities = [String]()
+        for key in keys {
+            guard let value = fields[key], ["enabled", "disabled"].contains(value) else { return nil }
+            authorities.append(key + ":=" + value)
+        }
+        guard let video = fields["v"], video.utf8.count <= 128,
+              video.range(of: #"^(jpg|h264|h265)(:[0-9x:]+)?$"#, options: .regularExpression) != nil else { return nil }
+        self.authorities = authorities
+        self.video = video
+    }
+
+    func body(id: String, origin: String, priority: Int) -> String {
+        let fields = ["s:=" + id] + authorities + [
+            "s.origin:=" + origin, "s.duration==0", "s.priority:=" + String(priority), "v:=" + video
+        ]
+        return fields.joined(separator: "\n") + "\n"
+    }
+}
+
 struct ControllerSessions {
-    private struct Session { var priority: Int; var lastSeen: TimeInterval }
+    private struct Session {
+        var priority: Int
+        var lastSeen: TimeInterval
+        var axisSpeeds: [String: String]
+    }
+
+    mutating func observeControlReply(_ fields: [String: String], session id: String?) {
+        guard let id, sessions[id] != nil else { return }
+        sessions[id]?.axisSpeeds.merge(fields.filter { CanonDefaultOpen.axisSpeedKeys.contains($0.key) }) { _, new in new }
+    }
     private var sessions: [String: Session] = [:]
-    private var owner: String?
+    private var bareSessionID: String?
+    private(set) var ownershipGeneration: UInt64 = 0
+    private var owner: String? {
+        didSet { if oldValue != owner { ownershipGeneration &+= 1 } }
+    }
+    static let controlledEndpoints: Set<String> = ["/-wvhttp-01-/control.cgi", "/-wvhttp-01-/preset/set",
+                                                   "/-wvhttp-01-/trace/set", "/-wvhttp-01-/trace/control"]
     private var streams: [ObjectIdentifier: (id: String, client: NWConnection)] = [:]
 
     mutating func trackStream(_ client: NWConnection, for id: String?) {
@@ -145,10 +197,11 @@ struct ControllerSessions {
         return ControllerSessionView(sessionID: id, origin: (host.contains(":") ? "[\(host)]" : host) + ":\(port)",
                                      control: id != nil && id == owner ? "enabled" : "disabled",
                                      priority: id.flatMap { sessions[$0]?.priority } ?? 0,
-                                     infoItems: params["item"], isInfo: request.path == "/-wvhttp-01-/info.cgi")
+                                     infoItems: params["item"], isInfo: request.path == "/-wvhttp-01-/info.cgi",
+                                     axisSpeeds: id.flatMap { sessions[$0]?.axisSpeeds } ?? [:])
     }
 
-    mutating func localReply(for request: HTTPRequest) throws -> HTTPResponse? {
+    mutating func localReply(for request: HTTPRequest, defaultOpen: CanonDefaultOpen? = nil) throws -> HTTPResponse? {
         let params = try request.parameters
         let now = ProcessInfo.processInfo.systemUptime
         let id = params["s"]
@@ -158,19 +211,30 @@ struct ControllerSessions {
             guard let priority = Int(params["s.priority"] ?? params["priority"] ?? "0"), (0...50).contains(priority) else {
                 return xc("403 Invalid Parameter Value", "")
             }
+            // The listener admits one physical controller. Its bare open after a
+            // reboot replaces its previous bare session, even if that session
+            // raised priority and the power loss prevented a close.
+            if params.isEmpty, let previous = bareSessionID {
+                invalidateStreams(for: previous)
+                sessions.removeValue(forKey: previous)
+            }
             let activeStreams = Set(streams.values.map(\.id))
             sessions = sessions.filter { now - $0.value.lastSeen < 60 || activeStreams.contains($0.key) }
             if let owner, sessions[owner] == nil { self.owner = nil }
             guard sessions.count < 32 else { return xc("503 Too many clients", "") }
             let uuid = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
             let newID = String(uuid.prefix(4)) + "-" + uuid.suffix(8)
-            sessions[newID] = Session(priority: priority, lastSeen: now)
+            sessions[newID] = Session(priority: priority, lastSeen: now, axisSpeeds: defaultOpen?.axisSpeeds ?? [:])
+            if params.isEmpty { bareSessionID = newID }
             // One configured physical controller; XC controllers may send movement directly after open.
             if (owner.flatMap { sessions[$0]?.priority } ?? 0) <= priority {
                 invalidateStreams(for: owner)
                 owner = newID
             }
             let origin = try view(for: request).origin
+            if params.isEmpty, let defaultOpen {
+                return xc("0", defaultOpen.body(id: newID, origin: origin, priority: priority))
+            }
             let control = owner == newID ? "enabled" : "disabled"
             return xc("0", "s:=\(newID)\r\ns.authority.audio:=disabled\r\ns.authority.control:=enabled\r\ns.authority.video:=enabled\r\ns.origin:=\(origin)\r\ns.duration:=0\r\ns.priority:=\(priority)\r\ns.control:=\(control)\r\n")
         }
@@ -184,6 +248,7 @@ struct ControllerSessions {
             if endpoint.hasSuffix("/close.cgi") {
                 invalidateStreams(for: id)
                 sessions.removeValue(forKey: id)
+                if bareSessionID == id { bareSessionID = nil }
                 if owner == id { owner = nil }
                 return xc("0", "OK\r\n")
             }
@@ -205,8 +270,7 @@ struct ControllerSessions {
             }
             return xc("0", owner == id ? "s.control:=enabled\r\n" : "s.control:=waiting\r\n")
         default:
-            if let id, id != owner, ["/-wvhttp-01-/control.cgi", "/-wvhttp-01-/preset/set",
-                                      "/-wvhttp-01-/trace/set", "/-wvhttp-01-/trace/control"].contains(endpoint) {
+            if let id, id != owner, Self.controlledEndpoints.contains(endpoint) {
                 return xc("301 No Control Privilege", "")
             }
             return nil

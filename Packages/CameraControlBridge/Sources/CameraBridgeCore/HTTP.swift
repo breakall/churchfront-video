@@ -6,6 +6,27 @@ struct HTTPRequest: Sendable {
     var target: String
     var headers: [String: String]
     var body: Data
+    var version = "HTTP/1.1"
+    // These are bounded startup snapshots used before a joystick session.
+    var isDiscoverySnapshot: Bool {
+        guard method == "GET", path == "/-wvhttp-01-/info.cgi", let params = try? parameters,
+              params.count == 1, let item = params["item"] else { return false }
+        return ["s", "f.tally", "f.standby"].contains(item)
+    }
+    // The RC-IP100 repeatedly requests this finite camera-state snapshot on
+    // one connection. Explicit stream/timeout requests use the stream handler.
+    var isControllerStatusPoll: Bool {
+        guard method == "GET", path == "/-wvhttp-01-/info.cgi", let params = try? parameters,
+              params.count == 2, params["s"] != nil, let item = params["item"] else { return false }
+        return item == "c,p,t,f,o,m,u"
+    }
+    var permitsDiscoveryReuse: Bool {
+        guard version == "HTTP/1.1", method == "GET",
+              !(headers["connection"] ?? "").lowercased().split(separator: ",").contains(where: {
+                  $0.trimmingCharacters(in: .whitespaces) == "close"
+              }) else { return false }
+        return isDiscoverySnapshot || isControllerStatusPoll || (path == "/-wvhttp-01-/open.cgi" && (try? parameters.isEmpty) == true)
+    }
     var path: String { String(target.split(separator: "?", maxSplits: 1).first ?? "") }
     var parameters: [String: String] {
         get throws {
@@ -42,14 +63,15 @@ struct HTTPResponse: Sendable {
         HTTPResponse(status: status, headers: ["content-type": "application/json"],
                      body: (try? JSONEncoder().encode(value)) ?? Data())
     }
-    func wire() -> Data {
+    func wire(keepAlive: Bool = false) -> Data {
         if let originalWire { return originalWire }
         var data = Data("HTTP/1.1 \(status) \(status == 200 ? "OK" : "Response")\r\n".utf8)
         let excluded = Set(["connection", "content-length", "transfer-encoding", "keep-alive", "proxy-connection", "trailer"])
         for (key, value) in headers where !excluded.contains(key.lowercased()) && !value.contains("\r") && !value.contains("\n") {
             data.append(Data("\(key): \(value)\r\n".utf8))
         }
-        data.append(Data("Content-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)); data.append(body)
+        let connection = keepAlive ? "keep-alive" : "close"
+        data.append(Data("Content-Length: \(body.count)\r\nConnection: \(connection)\r\n\r\n".utf8)); data.append(body)
         return data
     }
 }
@@ -120,38 +142,62 @@ final class HTTPListener: @unchecked Sendable {
                 let id = ObjectIdentifier(connection)
                 self.connections[id] = connection
                 connection.start(queue: self.queue)
-                let deadline = Deadline(queue: self.queue) { [weak self] in
-                    self?.diagnostic?("listener_rejected", "request_deadline", nil)
-                    connection.cancel(); self?.connections.removeValue(forKey: id)
-                }
-                self.receive(connection, buffer: Data()) { [weak self] request in
-                    Task {
-                        let response: HTTPResponse
-                        do {
-                            let request = try request.get()
-                            self?.diagnostic?("listener_request", "", request)
-                            if request.path == "/-wvhttp-01-/info.cgi", let stream = self?.streamHandler {
-                                deadline.cancel()
-                                await stream(request, connection)
-                                connection.cancel()
-                                self?.queue.async { [weak self] in self?.connections.removeValue(forKey: id) }
-                                return
-                            }
-                            response = await self?.handler?(request) ?? HTTPResponse(status: 503)
-                        }
-                        catch let error as HTTPError {
-                            self?.diagnostic?("listener_rejected", error.diagnosticReason, nil)
-                            response = .json(["error": error.message], status: error.status)
-                        }
-                        catch { self?.diagnostic?("listener_rejected", "other", nil); response = HTTPResponse(status: 400) }
-                        connection.send(content: response.wire(), completion: .contentProcessed { _ in
-                            deadline.cancel(); connection.cancel()
-                            self?.queue.async { [weak self] in self?.connections.removeValue(forKey: id) }
-                        })
-                    }
-                }
+                self.serve(connection)
             }
             listener.start(queue: queue)
+        }
+    }
+    private func serve(_ connection: NWConnection) {
+        let id = ObjectIdentifier(connection)
+        let deadline = Deadline(queue: queue) { [weak self] in
+            self?.diagnostic?("listener_rejected", "request_deadline", nil)
+            connection.cancel()
+            self?.connections.removeValue(forKey: id)
+        }
+        receive(connection, buffer: Data()) { [weak self] result in
+            guard let self else { return }
+            Task { [self] in
+                let response: HTTPResponse
+                var keepAlive = false
+                do {
+                    let request = try result.get()
+                    self.diagnostic?("listener_request", "", request)
+                    keepAlive = self.streamHandler != nil && request.permitsDiscoveryReuse
+                    if request.path == "/-wvhttp-01-/info.cgi", !(keepAlive && (request.isDiscoverySnapshot || request.isControllerStatusPoll)),
+                       let streamHandler = self.streamHandler {
+                        deadline.cancel()
+                        await streamHandler(request, connection)
+                        connection.cancel()
+                        self.queue.async { self.connections.removeValue(forKey: id) }
+                        return
+                    }
+                    response = await self.handler?(request) ?? HTTPResponse(status: 503)
+                } catch let error as HTTPError {
+                    if error.status == 499 {
+                        deadline.cancel()
+                        connection.cancel()
+                        self.queue.async { self.connections.removeValue(forKey: id) }
+                        return
+                    }
+                    self.diagnostic?("listener_rejected", error.diagnosticReason, nil)
+                    response = .json(["error": error.message], status: error.status)
+                } catch {
+                    self.diagnostic?("listener_rejected", "other", nil)
+                    response = HTTPResponse(status: 400)
+                }
+                let reuse = keepAlive && response.status == 200
+                connection.send(content: response.wire(keepAlive: reuse), completion: .contentProcessed { error in
+                    deadline.cancel()
+                    self.queue.async {
+                        if reuse, error == nil, self.connections[id] != nil {
+                            self.serve(connection)
+                        } else {
+                            connection.cancel()
+                            self.connections.removeValue(forKey: id)
+                        }
+                    }
+                })
+            }
         }
     }
     private func receive(_ connection: NWConnection, buffer: Data,
@@ -160,6 +206,7 @@ final class HTTPListener: @unchecked Sendable {
             var buffer = buffer; if let data { buffer.append(data) }
             do {
                 if let request = try Self.parse(buffer) { completion(.success(request)); return }
+                if done && buffer.isEmpty { completion(.failure(HTTPError(499, "Peer closed"))); return }
                 if done || error != nil { completion(.failure(HTTPError(400, "Incomplete request"))); return }
                 self?.receive(connection, buffer: buffer, completion: completion)
             } catch { completion(.failure(error)) }
@@ -188,7 +235,7 @@ final class HTTPListener: @unchecked Sendable {
         let body = data[end.upperBound...]
         guard body.count >= length else { return nil }
         guard body.count == length else { throw HTTPError(400, "Pipelining not supported") }
-        return HTTPRequest(method: String(first[0]), target: String(first[1]), headers: headers, body: Data(body))
+        return HTTPRequest(method: String(first[0]), target: String(first[1]), headers: headers, body: Data(body), version: String(first[2]))
     }
     func stop() { queue.async { [self] in listener?.cancel(); connections.values.forEach { $0.cancel() }; connections.removeAll() } }
 }

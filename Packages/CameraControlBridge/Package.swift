@@ -5,6 +5,7 @@ let package = Package(
     name: "CameraControlBridge",
     platforms: [.macOS(.v14)],
     products: [
+        .library(name: "CameraBridgeCore", targets: ["CameraBridgeCore"]),
         .library(name: "CameraBridgeClient", targets: ["CameraBridgeClient"]),
         .executable(name: "camera-control-bridge", targets: ["CameraControlBridge"]),
     ],

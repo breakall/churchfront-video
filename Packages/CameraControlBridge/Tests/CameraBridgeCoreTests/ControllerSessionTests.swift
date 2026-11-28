@@ -3,6 +3,49 @@ import XCTest
 @testable import CameraBridgeCore
 
 final class ControllerSessionTests: XCTestCase {
+    func testBareHardwareOpenMatchesCanonBodyWithLocalIdentity() throws {
+        let fields = ["s": "camera-secret", "s.origin": "192.0.2.20:80",
+                      "s.authority.audio": "disabled", "s.authority.control": "enabled",
+                      "s.authority.video": "enabled", "v": "jpg:1280x720:6:14980"]
+        let camera = try XCTUnwrap(CanonDefaultOpen(fields))
+        var sessions = ControllerSessions(host: "192.0.2.10", port: 18080)
+        let request = HTTPRequest.canon("open.cgi", parameters: [:])
+        let reply = try XCTUnwrap(try sessions.localReply(for: request, defaultOpen: camera))
+        let body = String(decoding: reply.body, as: UTF8.self)
+        let first = try XCTUnwrap(body.split(separator: "\n").first)
+        XCTAssertTrue(first.hasPrefix("s:="))
+        let id = String(first.dropFirst(3))
+        XCTAssertFalse(id.isEmpty)
+        XCTAssertNotEqual(id, fields["s"])
+        XCTAssertEqual(body, "s:=\(id)\ns.authority.audio:=disabled\ns.authority.control:=enabled\ns.authority.video:=enabled\ns.origin:=192.0.2.10:18080\ns.duration==0\ns.priority:=0\nv:=jpg:1280x720:6:14980\n")
+        let claim = HTTPRequest.canon("claim.cgi", parameters: ["s": id])
+        XCTAssertEqual(try sessions.localReply(for: claim)?.headers["livescope-status"], "0")
+    }
+
+    func testControllerReceivesItsSessionSpeedSettingsAndAcknowledgedUpdates() throws {
+        let speed = "c.1.pan.speed.dir"
+        let tilt = "c.1.tilt.speed.dir"
+        var camera = try XCTUnwrap(CanonDefaultOpen([
+            "s.authority.audio": "disabled", "s.authority.control": "enabled",
+            "s.authority.video": "enabled", "v": "jpg:1280x720:6:14980"
+        ]))
+        camera.axisSpeeds = [speed: "10000", tilt: "10000"]
+        var sessions = ControllerSessions(host: "127.0.0.1", port: 18080)
+        let opened = try XCTUnwrap(try sessions.localReply(for: .canon("open.cgi", parameters: [:]), defaultOpen: camera))
+        let id = try XCTUnwrap(opened.canonFields["s"])
+        let info = HTTPRequest.canon("info.cgi", parameters: ["s": id, "item": "c,c.1.tilt!"])
+        let snapshot = ControllerSessionView.xc("0", "c.1.pan.speed.max:=10000\n")
+        let initial = try sessions.view(for: info).reply(snapshot)
+        XCTAssertEqual(initial.canonFields[speed], "10000")
+        XCTAssertFalse(initial.body.contains(13), "Canon LF status framing survives translation")
+        sessions.observeControlReply([speed: "312", "unrelated": "ignored"], session: id)
+        let fields = try sessions.view(for: info).reply(snapshot).canonFields
+        XCTAssertEqual(fields[speed], "312")
+        XCTAssertNil(fields[tilt])
+        XCTAssertNil(fields["unrelated"])
+        XCTAssertNil(try sessions.view(for: .canon("info.cgi", parameters: [:])).reply(snapshot).canonFields[speed])
+    }
+
     private let scoped = ControllerSessionView(sessionID: "virtual-id", origin: "192.0.2.1:8080", control: "enabled",
                                               priority: 0, infoItems: "s,c.1", isInfo: true)
 

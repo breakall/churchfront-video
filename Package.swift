@@ -30,6 +30,7 @@ let package = Package(
         // Runs the camera code against pretend cameras on this Mac: swift test
         .testTarget(name: "CueATEMTests", dependencies: ["CueATEM"], path: "Tests/CueATEMTests"),
         .testTarget(name: "CueVideoTests", dependencies: ["CueVideo", "CueATEM",
-            .product(name: "CameraBridgeClient", package: "CameraControlBridge")], path: "Tests/CueVideoTests"),
+            .product(name: "CameraBridgeClient", package: "CameraControlBridge"),
+            .product(name: "CameraBridgeCore", package: "CameraControlBridge")], path: "Tests/CueVideoTests"),
     ]
 )

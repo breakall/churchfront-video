@@ -107,6 +107,7 @@ final class AutoTracker: ObservableObject {
     enum Phase: String { case starting, following, searching, lost }
 
     struct Session {
+        let id = UUID()
         let camera: UUID
         var phase: Phase = .starting
         var target: TrackedPerson?
@@ -234,6 +235,12 @@ final class AutoTracker: ObservableObject {
         }
     }
 
+    /// Called on the main queue after the helper has authorized this exact controller press.
+    func startFromController(_ camera: PTZCamera) {
+        stop(camera.id, revoke: false)
+        begin(camera, at: nil, size: nil, person: nil, done: nil)
+    }
+
     private func begin(_ camera: PTZCamera, at point: CGPoint?, size: ShotSize?, person: String?, done: ((String?) -> Void)?) {
         guard let picture = CameraPicture.of(camera) else {
             revokeAuthorization?(camera.id)
@@ -310,14 +317,12 @@ final class AutoTracker: ObservableObject {
     // MARK: Frames
 
     private func frame(_ img: CGImage, _ id: UUID) {
-        guard sessions[id] != nil, !busy.contains(id) else { return }  // still working on the last frame: skip
+        guard let sessionID = sessions[id]?.id, !busy.contains(id) else { return }  // still working on the last frame: skip
         busy.insert(id)
         vision.async { [weak self] in
             let people = Self.detect(img)
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.busy.remove(id)
-                self.update(id, people)
+                self?.finishFrame(people, camera: id, session: sessionID)
             }
         }
     }
@@ -404,9 +409,9 @@ final class AutoTracker: ObservableObject {
         return found
     }
 
-    private func update(_ id: UUID, _ people: [TrackedPerson]) {
-        guard var s = sessions[id] else { return }
-        let now = Date()
+    func finishFrame(_ people: [TrackedPerson], camera id: UUID, session: UUID, at now: Date = Date()) {
+        guard var s = sessions[id], s.id == session else { return }
+        busy.remove(id)
         s.people = people
         s.lastFrame = now
 
@@ -761,8 +766,9 @@ final class AutoTracker: ObservableObject {
         guard var s = sessions[id], !s.polling else { return }
         s.polling = true
         sessions[id] = s
+        let sessionID = s.id
         ptz.readPosition(camera: id) { [weak self] pos in
-            guard let self, var s = self.sessions[id] else { return }
+            guard let self, var s = self.sessions[id], s.id == sessionID else { return }
             s.polling = false
             if let pos {
                 let now = Date()

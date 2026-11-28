@@ -4,6 +4,7 @@ import Foundation
 struct CameraSessionLease: Equatable, Sendable {
     let id: String
     let epoch: UInt64
+    let defaultOpen: CanonDefaultOpen?
 }
 
 extension HTTPRequest {
@@ -23,7 +24,7 @@ extension HTTPResponse {
         return code == "501" || code == "301"
     }
 
-    fileprivate var canonFields: [String: String] {
+    var canonFields: [String: String] {
         BridgeCameraReply(status: status, headers: headers, body: String(decoding: body, as: UTF8.self)).fields
     }
 
@@ -38,6 +39,7 @@ actor CameraSessionOwner {
     private let send: @Sendable (HTTPRequest) async throws -> HTTPResponse
     private var active: CameraSessionLease?
     private var retired: CameraSessionLease?
+    private var confirmRetirement = false
     private var opening: Task<OpenedSession, Error>?
     private var renewing: Task<Void, Error>?
     private var epoch: UInt64 = 0
@@ -71,10 +73,13 @@ actor CameraSessionOwner {
                 throw BridgeFailure("Camera session reconnect pending", status: 503)
             }
             let previous = retired
-            retired = nil
-            attempt = Task { [send, epoch, needsStop] in
+            if !confirmRetirement { retired = nil }
+            attempt = Task { [send, epoch, needsStop, confirmRetirement] in
                 if let previous {
-                    _ = try? await send(.canon("close.cgi", parameters: ["s": previous.id]))
+                    let close = try? await send(.canon("close.cgi", parameters: ["s": previous.id]))
+                    if confirmRetirement, close?.canonSucceeded != true, close?.sessionExpired != true {
+                        throw BridgeFailure("Previous camera session closure unconfirmed", status: 503)
+                    }
                 }
                 let reply = try await send(.canon("open.cgi", parameters: ["s.priority": "0"]))
                 guard reply.canonSucceeded, let id = reply.canonFields["s"], !id.isEmpty else {
@@ -87,7 +92,17 @@ actor CameraSessionOwner {
                         let stop = try await send(Self.stopRequest(id))
                         guard stop.canonSucceeded else { throw BridgeFailure("Camera recovery stop unconfirmed", status: 502) }
                     }
-                    return OpenedSession(lease: CameraSessionLease(id: id, epoch: epoch), renewAfter: renewAfter)
+                    var descriptor = CanonDefaultOpen(reply.canonFields)
+                    if descriptor != nil {
+                        let request = HTTPRequest.canon("info.cgi", parameters: [
+                            "s": id, "item": "c.1.pan.speed,c.1.tilt.speed", "timeout": "1"
+                        ])
+                        if let info = try? await send(request), info.canonSucceeded {
+                            descriptor?.axisSpeeds = info.canonFields.filter { CanonDefaultOpen.axisSpeedKeys.contains($0.key) }
+                        }
+                    }
+                    let lease = CameraSessionLease(id: id, epoch: epoch, defaultOpen: descriptor)
+                    return OpenedSession(lease: lease, renewAfter: renewAfter)
                 } catch {
                     _ = try? await send(.canon("close.cgi", parameters: ["s": id]))
                     throw error
@@ -103,6 +118,8 @@ actor CameraSessionOwner {
             }
             if active == nil {
                 active = result.lease
+                retired = nil
+                confirmRetirement = false
                 needsStop = false
                 nextClaim = ProcessInfo.processInfo.systemUptime + result.renewAfter
                 opening = nil
@@ -116,6 +133,10 @@ actor CameraSessionOwner {
             }
             throw error
         }
+    }
+
+    func requireConfirmedClosure(of lease: CameraSessionLease) {
+        if active == lease { confirmRetirement = true }
     }
 
     /// Epoch comparison also fences delayed 501 responses from an older

@@ -27,7 +27,16 @@ public actor BridgeClient {
     public func start(_ lease: BridgeLease) async throws -> BridgeLease { try await request("start", value: lease) }
     public func stop(_ lease: BridgeLease) async throws -> BridgeLease { try await request("stop", value: lease) }
     public func disconnect(_ lease: BridgeLease) async throws -> BridgeStatus { try await request("disconnect", value: lease) }
-    public func heartbeat(_ lease: BridgeLease) async throws -> BridgeStatus { try await request("heartbeat", value: lease) }
+    public func heartbeat(_ lease: BridgeLease, trackingActive: Bool? = nil) async throws -> BridgeStatus {
+        struct Heartbeat: Encodable {
+            let version: Int
+            let connection: String
+            let generation: UInt64
+            let trackingActive: Bool?
+        }
+        return try await request("heartbeat", value: Heartbeat(version: lease.version, connection: lease.connection,
+                                                               generation: lease.generation, trackingActive: trackingActive))
+    }
     public func status() async throws -> BridgeStatus { try await request("status", body: nil) }
     public func send(_ command: BridgeCommand) async throws -> BridgeCameraReply { try await request("command", value: command) }
 

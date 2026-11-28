@@ -8,10 +8,11 @@ final class Upstream: @unchecked Sendable {
     private let queue = DispatchQueue(label: "camera-bridge.upstream")
     init(url: URL, timeout: Double) { self.url = url; self.timeout = timeout }
 
-    func wire(_ request: HTTPRequest) -> Data {
+    func wire(_ request: HTTPRequest, keepAlive: Bool = false) -> Data {
         let port = url.port ?? (url.scheme == "https" ? 443 : 80)
         let excluded = Set(["host", "connection", "content-length", "transfer-encoding", "keep-alive", "proxy-connection", "proxy-authorization", "upgrade", "te", "trailer"])
-        var wire = Data("\(request.method) \(request.target) HTTP/1.1\r\nHost: \(url.host!):\(port)\r\nConnection: close\r\n".utf8)
+        let persistence = keepAlive ? "keep-alive" : "close"
+        var wire = Data("\(request.method) \(request.target) HTTP/1.1\r\nHost: \(url.host!):\(port)\r\nConnection: \(persistence)\r\n".utf8)
         for (key, value) in request.headers where !excluded.contains(key) { wire.append(Data("\(key): \(value)\r\n".utf8)) }
         wire.append(Data("Content-Length: \(request.body.count)\r\n\r\n".utf8)); wire.append(request.body)
         return wire
@@ -22,7 +23,7 @@ final class Upstream: @unchecked Sendable {
         let host = url.host!
         let port = url.port ?? (tls ? 443 : 80)
         let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: UInt16(port))!, using: tls ? .tls : .tcp)
-        let bytes = wire(request)
+        let bytes = wire(request, keepAlive: preserveWire)
         return try await withCheckedThrowingContinuation { continuation in
             var finished = false
             let deadline = DispatchWorkItem {

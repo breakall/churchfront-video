@@ -11,6 +11,7 @@ swift test --package-path Packages/CameraControlBridge --scratch-path "$BRIDGE_C
 swift build --package-path Packages/CameraControlBridge --scratch-path "$BRIDGE_CHECK_HELPER_BUILD" --product camera-control-bridge
 BRIDGE_CHECK_BINARY="$(swift build --package-path Packages/CameraControlBridge --scratch-path "$BRIDGE_CHECK_HELPER_BUILD" --show-bin-path)/camera-control-bridge"
 
-PYTHONPATH=Tools PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s Tools/camera_rig/tests -v
+CAMERA_BRIDGE_TEST_BINARY="$BRIDGE_CHECK_BINARY" PYTHONPATH=Tools PYTHONDONTWRITEBYTECODE=1 \
+    python3 -m unittest discover -s Tools/camera_rig/tests -v
 python3 Tools/camera-rig.py bridge-test --bridge-binary "$BRIDGE_CHECK_BINARY" --output .camera-rig/helper-verification.json
 swift test --scratch-path "$BRIDGE_CHECK_APP_BUILD" --filter 'CameraBridge|BridgeAdapterRoutingTests|BridgeRouteChangesTests|CanonXCRegressionTests|CameraStopTests'

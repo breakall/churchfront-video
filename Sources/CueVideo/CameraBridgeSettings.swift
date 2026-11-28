@@ -1,5 +1,6 @@
 import Foundation
 import CueATEM
+import CameraBridgeClient
 
 /// One bridge connection for the booth's single Canon camera.
 struct CameraBridgeSettings: Codable, Equatable {
@@ -37,7 +38,7 @@ struct CameraBridgeSettings: Codable, Equatable {
               controllerPort != appPort else {
             throw CameraBridgeSetupError("Enter the Mac listener address, RC-IP100 address, and two different nonzero ports.")
         }
-        guard !nativeTrackingControl else {
+        guard !nativeTrackingControl || ControllerTrackingPress.rcIP100Mapping != nil else {
             throw CameraBridgeSetupError("Native tracking interception needs controller verification and is not available in this build.")
         }
         return canon[0]

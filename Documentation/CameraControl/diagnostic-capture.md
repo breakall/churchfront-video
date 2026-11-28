@@ -23,3 +23,24 @@ The helper owns one upstream Canon session and renews its control privilege whil
 Snapshot inspection reuses the existing 64-KiB observer bound and parser; it does not decode arbitrary multipart parts or promise complete classification for indefinite streams. Missing snapshot metadata is not evidence that the camera omitted the field. Unknown or sensitive values become `other`; request bodies, raw URLs/headers, session IDs, session hashes, passwords, bearer tokens, and authentication challenges are excluded.
 
 Logging remains off the movement queue, with a maximum of 256 pending events, 1-MiB rotation and two previous files. A busy or failed log sink drops diagnostic events rather than blocking forwarding; check `droppedDiagnosticEvents` before drawing conclusions from an absent command. High-frequency status polling can rotate the files quickly, so export promptly after a short capture.
+
+## Capture the RC-IP100 tracking menu
+
+The normal diagnostics deliberately discard unfamiliar parameter names and values. For the tracking-button mapping, the Mac can passively record the RC-IP100’s HTTP conversation with the bridge listener. Run the capture off-air. The current release passes native tracking requests through, so a real Start press can activate Canon tracking if the camera supports it.
+
+From the repository root, with the bridge running and the RC-IP100 pointed at the Mac’s bridge slot, run:
+
+```sh
+python3 Tools/capture-rc-tracking.py record
+```
+
+The recorder reads the controller address, Mac listener address and port from the saved bridge configuration. Override them if needed with `--controller RC_IP --bridge MAC_IP --port 18080`. Use the Mac’s address for `--bridge`. The camera has its own upstream address. The tool checks the selected interface and restricts capture to both directions of that controller-to-listener connection. macOS may ask for the local administrator password in Terminal to open the capture device. The script and decoder run as the current user.
+
+1. Wait for **Recording**. Start on the screen before the tracking menu and let idle traffic accumulate for a few seconds.
+2. Press Return, then open the tracking menu. Allow the menu to settle and note whether Start is available.
+3. Press Return, then press Start once. Let the indicator settle.
+4. Press Return, then press Stop once. Let the indicator settle and press Return to finish. If the control is unavailable, interrupt with Control-C and note what the screen showed.
+
+Each run creates a private directory under `.camera-rig/tracking-captures/`. The original `controller.pcap` contains the full requests and replies and can contain credentials or session IDs. Keep the capture local. `markers.json` records the time windows and termination reason. `exchanges.json` indexes HTTP methods, paths, query and form fields, response codes, numeric Livescope statuses and recognizable Canon reply fields. Use the frame and TCP stream numbers to inspect unfamiliar values or multipart data in the private capture. Check `capture.log` and drop counts before interpreting an empty window. Traffic that bypasses the bridge falls outside this filter. The time windows show correlation with operator actions.
+
+The recorder stops at operator completion, 180 seconds, 8,192 packets, or an observed file size of 16 MiB. `python3 Tools/capture-rc-tracking.py decode RUN_DIRECTORY` regenerates the index. `python3 Tools/capture-rc-tracking.py rehearse` tests the filter, TCP reassembly, decoding, markers and session redaction with synthetic packets. These commands use the Wireshark CLI tools available from `brew install wireshark`. [TShark manual](https://www.wireshark.org/docs/man-pages/tshark.html)

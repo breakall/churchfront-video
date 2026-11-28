@@ -34,6 +34,7 @@ final class CameraBridgeConnection: @unchecked Sendable {
     private let expectedBuild: String?
     private let lock = NSLock()
     private var currentLease: BridgeLease?
+    private var reportedTracking: (lease: BridgeLease, active: Bool)?
     private var authorized = false
     private var active = true
     private var pending: [Pending] = []
@@ -51,6 +52,13 @@ final class CameraBridgeConnection: @unchecked Sendable {
     private func snapshot() -> BridgeLease? { lock.withLock { active ? currentLease : nil } }
     var commandFence: String? {
         snapshot().map { "\($0.connection):\($0.generation)" }
+    }
+
+    func reportTracking(_ active: Bool, for status: BridgeStatus) {
+        lock.withLock {
+            guard let lease = currentLease, lease.connection == status.connection, lease.generation == status.generation else { return }
+            reportedTracking = (lease, active)
+        }
     }
 
     private func matches(_ lease: BridgeLease) -> Bool { snapshot() == lease }
@@ -112,7 +120,8 @@ final class CameraBridgeConnection: @unchecked Sendable {
                     let status = try await self.client.status()
                     if self.observe(status, expected: expected), let lease = self.snapshot() {
                         requestLease = lease
-                        _ = self.observe(try await self.client.heartbeat(lease), expected: lease)
+                        let tracking = self.lock.withLock { self.reportedTracking?.lease == lease ? self.reportedTracking?.active : nil }
+                        _ = self.observe(try await self.client.heartbeat(lease, trackingActive: tracking), expected: lease)
                     }
                 } catch {
                     if (error as? BridgeFailure)?.status != 409 {

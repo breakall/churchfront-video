@@ -23,6 +23,14 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(original.identity.count, 64)
         var newRoute = original; newRoute.cameraURL = "http://127.0.0.1:18083"
         XCTAssertNotEqual(original.identity, newRoute.identity)
+        var interception = original
+        interception.nativeTrackingControl = false
+        XCTAssertEqual(interception.identity, original.identity)
+        interception.nativeTrackingControl = true
+        XCTAssertNotEqual(interception.identity, original.identity)
+        if ControllerTrackingPress.rcIP100Mapping == nil {
+            XCTAssertThrowsError(try BridgeService(configuration: interception))
+        }
         var optOut = original; optOut.diagnosticsEnabled = false
         XCTAssertEqual(original.identity, optOut.identity, "Live diagnostic changes preserve the route identity")
     }

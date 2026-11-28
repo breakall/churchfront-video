@@ -278,12 +278,13 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         let directory = helperDirectory
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
-        let configuration = BridgeConfiguration(cameraURL: url.absoluteString, listenHost: settings.listenHost,
+        var configuration = BridgeConfiguration(cameraURL: url.absoluteString, listenHost: settings.listenHost,
             controllerPort: settings.controllerPort, appPort: settings.appPort,
             controllerAddress: settings.controllerAddress, tokenFile: directory.appendingPathComponent("app-token").path,
             readyFile: directory.appendingPathComponent("ready.json").path,
             diagnosticsFile: directory.appendingPathComponent("diagnostics.jsonl").path,
             diagnosticsEnabled: settings.diagnosticsEnabled)
+        configuration.nativeTrackingControl = settings.nativeTrackingControl
         let data = try JSONEncoder().encode(configuration)
         configurationID = configuration.identity
         let config = directory.appendingPathComponent("helper.json")
@@ -312,7 +313,7 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
         return try ready.helper_build != bundledHelperBuild()
     }
 
-    private func attach(expected: UUID) async throws {
+    @MainActor private func attach(expected: UUID) async throws {
         message = "Connecting to the bridge…"
         var lastError: Error = CameraBridgeSetupError("The helper has not started. Check background-item approval in System Settings.")
         for _ in 0..<40 {
@@ -330,45 +331,57 @@ final class CameraBridgeRuntime: ObservableObject, @unchecked Sendable {
                     throw CameraBridgeSetupError("Restart the bridge to use the helper included in this application build.")
                 }
                 let next = CameraBridgeConnection(url: url, token: token, configurationID: configurationID, helperBuild: build)
-                next.onStatus = { [weak self, weak next] status in
-                    DispatchQueue.main.async {
-                        guard let self, self.revision == expected, self.currentConnection() === next,
-                              next?.commandFence == status.connection.map({ "\($0):\(status.generation)" }) else { return }
-                        let previous = self.status
-                        self.status = status
-                        self.running = true
-                        self.message = status.recoveryRequired ? "Bridge restarted. Release pan, tilt, zoom and focus on the physical controller before enabling tracking. Move and release each control if it does not send an idle stop." :
-                            status.health != "ready" ? "Camera route unavailable. Tracking is off." :
-                            status.authorized ? "Tracking has control." : status.manualTakeover ? "Manual control. Tracking is off." : "Bridge ready. Tracking is off."
-                        let revoked = previous?.authorized == true ||
-                            (status.manualTakeover && previous?.generation != status.generation)
-                        if !status.authorized, revoked, let id = self.camera?.id { self.onTrackingRevoked?(id) }
-                    }
-                }
-                next.onFailure = { [weak self, weak next] why, fence in
-                    DispatchQueue.main.async {
-                        guard let self, self.revision == expected, self.currentConnection() === next,
-                              next?.commandFence == fence || next?.commandFence == nil else { return }
-                        self.message = "Bridge unavailable: \(why)"
-                        self.recover(expected: expected)
-                    }
-                }
-                lock.withLock { connection = next; connectedCamera = camera }
-                do { try await next.connect() }
-                catch {
-                    lock.withLock { if connection === next { connection = nil; connectedCamera = nil } }
-                    await next.disconnect()
-                    throw error
-                }
-                guard revision == expected, currentConnection() === next, !Task.isCancelled else {
-                    await next.disconnect(); return
-                }
-                running = true
+                guard let camera else { throw CameraBridgeSetupError("No configured bridge camera.") }
+                guard revision == expected, !Task.isCancelled else { return }
+                try await attach(next, to: camera)
                 return
             } catch { lastError = error }
             try await Task.sleep(for: .milliseconds(100))
         }
         throw lastError
+    }
+
+    @MainActor func attach(_ next: CameraBridgeConnection, to camera: PTZCamera) async throws {
+        let expected = revision
+        next.onStatus = { [weak self, weak next] status in
+            DispatchQueue.main.async {
+                guard let self, self.revision == expected, self.currentConnection() === next,
+                      let camera = self.lock.withLock({ self.connectedCamera }),
+                      next?.commandFence == status.connection.map({ "\($0):\(status.generation)" }) else { return }
+                let previous = self.status
+                self.status = status
+                self.running = true
+                self.message = status.recoveryRequired ? "Bridge restarted. Release pan, tilt, zoom and focus on the physical controller before enabling tracking. Move and release each control if it does not send an idle stop." :
+                    status.health != "ready" ? "Camera route unavailable. Tracking is off." :
+                    status.authorized ? "Tracking has control." : status.manualTakeover ? "Manual control. Tracking is off." : "Bridge ready. Tracking is off."
+                let newGeneration = previous?.generation != status.generation || previous?.connection != status.connection
+                if status.authorized, newGeneration, status.controllerTrackingPress == .start {
+                    AutoTracker.shared.startFromController(camera)
+                }
+                let revoked = previous?.authorized == true || (newGeneration && (status.controllerTrackingPress == .stop || status.manualTakeover))
+                if !status.authorized, revoked { self.onTrackingRevoked?(camera.id) }
+                next?.reportTracking(AutoTracker.shared.isTracking(camera.id), for: status)
+            }
+        }
+        next.onFailure = { [weak self, weak next] why, fence in
+            DispatchQueue.main.async {
+                guard let self, self.revision == expected, self.currentConnection() === next,
+                      next?.commandFence == fence || next?.commandFence == nil else { return }
+                self.message = "Bridge unavailable: \(why)"
+                self.recover(expected: expected)
+            }
+        }
+        lock.withLock { connection = next; connectedCamera = camera }
+        do { try await next.connect() }
+        catch {
+            lock.withLock { if connection === next { connection = nil; connectedCamera = nil } }
+            await next.disconnect()
+            throw error
+        }
+        guard revision == expected, currentConnection() === next, !Task.isCancelled else {
+            await next.disconnect(); return
+        }
+        running = true
     }
 
     private func detach(expected: UUID) async {

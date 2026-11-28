@@ -13,6 +13,9 @@ public final class BridgeService {
     private var lockDescriptor: Int32 = -1
     private let configuration: BridgeConfiguration
     public init(configuration: BridgeConfiguration) throws {
+        guard configuration.nativeTrackingControl != true || ControllerTrackingPress.rcIP100Mapping != nil else {
+            throw BridgeFailure("Controller tracking interception requires a verified RC-IP100 mapping", status: 400)
+        }
         guard let url = URL(string: configuration.cameraURL), ["http", "https"].contains(url.scheme ?? ""),
               url.host != nil, url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               ["", "/"].contains(url.path), (1...65535).contains(url.port ?? 80),

@@ -10,6 +10,14 @@ public struct BridgeLease: Codable, Sendable, Equatable {
     }
 }
 
+public enum ControllerTrackingPress: String, Codable, Sendable {
+    case start, stop
+
+    public typealias Mapping = @Sendable (_ method: String, _ path: String, _ parameters: [String: String]) -> Self?
+    /// Install the verified RC-IP100 mapping here after recording its capability and button exchanges.
+    public static let rcIP100Mapping: Mapping? = nil
+}
+
 public struct BridgeStatus: Codable, Sendable, Equatable {
     public var version: Int = 1
     public var generation: UInt64
@@ -18,6 +26,8 @@ public struct BridgeStatus: Codable, Sendable, Equatable {
     public var health: String
     public var manualTakeover: Bool
     public var nativeTrackingSupported: Bool = false
+    public var controllerTrackingPress: ControllerTrackingPress?
+    public var appTrackingActive: Bool?
     public var diagnosticsEnabled: Bool
     public var droppedDiagnosticEvents: Int
     public var connection: String?
@@ -89,12 +99,14 @@ public struct BridgeConfiguration: Codable, Sendable, Equatable {
     public var readyFile: String?
     public var diagnosticsFile: String?
     public var diagnosticsEnabled: Bool
+    public var nativeTrackingControl: Bool?
     public var requestTimeout: Double
     public var leaseTimeout: Double
     public var identity: String {
-        let fields: [String: Any] = ["version": 1, "cameraURL": cameraURL, "listenHost": listenHost,
+        var fields: [String: Any] = ["version": 1, "cameraURL": cameraURL, "listenHost": listenHost,
             "controllerPort": controllerPort, "appPort": appPort, "controllerAddress": controllerAddress,
             "requestTimeout": requestTimeout, "leaseTimeout": leaseTimeout]
+        if nativeTrackingControl == true { fields["nativeTrackingControl"] = true }
         let data = (try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])) ?? Data()
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }

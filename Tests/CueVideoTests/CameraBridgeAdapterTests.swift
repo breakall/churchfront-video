@@ -149,6 +149,66 @@ final class CameraBridgeAdapterTests: XCTestCase {
         await connection.disconnect()
     }
 
+    func testJoystickReframeWhileFollowingStartsOnTheNewCenteredPerson() throws {
+        try verifyReframedTarget(afterLoss: false)
+    }
+
+    func testJoystickReframeAfterLosingPersonStartsOnTheNewCenteredPerson() throws {
+        try verifyReframedTarget(afterLoss: true)
+    }
+
+    private func verifyReframedTarget(afterLoss: Bool) throws {
+        let tracker = AutoTracker.shared
+        let oldStart = tracker.authorizeStart, oldRevoke = tracker.revokeAuthorization
+        var camera = PTZCamera()
+        camera.proto = .canonXC
+        camera.host = "127.0.0.1"
+        camera.port = 1
+        defer {
+            tracker.stop(camera.id, revoke: false)
+            tracker.authorizeStart = oldStart
+            tracker.revokeAuthorization = oldRevoke
+        }
+        var joystickHeld = false
+        tracker.authorizeStart = { _, done in done(joystickHeld ? "Manual control" : nil) }
+        tracker.revokeAuthorization = nil
+        func person(_ x: Double) -> TrackedPerson {
+            let box = CGRect(x: x - 0.08, y: 0.25, width: 0.16, height: 0.55)
+            return TrackedPerson(box: box, core: box, eye: CGPoint(x: x, y: 0.33))
+        }
+        let original = person(0.46)
+        let now = Date()
+        tracker.start(camera)
+        let old = try XCTUnwrap(tracker.sessions[camera.id]?.id)
+        tracker.finishFrame([original], camera: camera.id, session: old, at: now)
+        XCTAssertEqual(tracker.sessions[camera.id]?.target?.eye, original.eye)
+        if afterLoss {
+            tracker.finishFrame([], camera: camera.id, session: old, at: now.addingTimeInterval(6))
+            XCTAssertEqual(tracker.sessions[camera.id]?.phase, .lost)
+        } else {
+            XCTAssertEqual(tracker.sessions[camera.id]?.phase, .following)
+        }
+
+        joystickHeld = true
+        tracker.stop(camera.id, revoke: false)
+        tracker.start(camera)
+        XCTAssertFalse(tracker.isTracking(camera.id))
+        joystickHeld = false
+        XCTAssertFalse(tracker.isTracking(camera.id))
+        tracker.start(camera)
+        let fresh = try XCTUnwrap(tracker.sessions[camera.id]?.id)
+        XCTAssertNotEqual(old, fresh)
+        // Vision completes a pre-takeover frame after the new Track press.
+        tracker.finishFrame([original], camera: camera.id, session: old)
+        XCTAssertEqual(tracker.sessions[camera.id]?.phase, .starting)
+        XCTAssertNil(tracker.sessions[camera.id]?.target)
+
+        let newCenter = person(0.52)
+        tracker.finishFrame([person(0.12), newCenter], camera: camera.id, session: fresh)
+        XCTAssertEqual(tracker.sessions[camera.id]?.target?.eye, newCenter.eye)
+        XCTAssertEqual(tracker.sessions[camera.id]?.phase, .following)
+    }
+
     func testTrackingStartWaitsForAuthorizationAndReportsRejection() {
         let tracker = AutoTracker.shared
         let oldStart = tracker.authorizeStart, oldRevoke = tracker.revokeAuthorization
